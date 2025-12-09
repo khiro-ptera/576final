@@ -246,6 +246,48 @@ public class ImageDisplay {
         return bestAngle;
     }
 
+    private BufferedImage cleanBorderInpaint(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+
+        // Copy original first
+        Graphics2D g = out.createGraphics();
+        g.drawImage(img, 0, 0, null);
+        g.dispose();
+
+        // Top edge
+        for (int x = 0; x < w; x++) {
+            int safe = out.getRGB(x, Math.min(2, h-1));
+            out.setRGB(x, 0, safe);
+            if (h > 1) out.setRGB(x, 1, safe);
+        }
+
+        // Bottom edge
+        for (int x = 0; x < w; x++) {
+            int safe = out.getRGB(x, Math.max(h-3, 0));
+            out.setRGB(x, h-1, safe);
+            if (h > 1) out.setRGB(x, h-2, safe);
+        }
+
+        // Left edge
+        for (int y = 0; y < h; y++) {
+            int safe = out.getRGB(Math.min(2,w-1), y);
+            out.setRGB(0, y, safe);
+            if (w > 1) out.setRGB(1, y, safe);
+        }
+
+        // Right edge
+        for (int y = 0; y < h; y++) {
+            int safe = out.getRGB(Math.max(w-3,0), y);
+            out.setRGB(w-1, y, safe);
+            if (w > 1) out.setRGB(w-2, y, safe);
+        }
+
+        return out;
+    }
+
+
     private BufferedImage extractAndRotatePiece(List<Point> pixels,
                                                 Rectangle bounds,
                                                 double angleDegrees) {
@@ -291,7 +333,11 @@ public class ImageDisplay {
         g2d.dispose();
 
         BufferedImage cropped = cropToContent(rotated);
-        return argbToRgb(cropped);
+        BufferedImage rgb = argbToRgb(cropped);
+
+        rgb = cleanBorderInpaint(rgb);
+
+        return rgb;
     }
 
     private BufferedImage cropToContent(BufferedImage img) {
@@ -634,12 +680,57 @@ public class ImageDisplay {
         return d;
     }
 
+    /**
+     * Direct per-pixel RGB difference along two CLEAN edges.
+     * Lower = better match. This is the strongest cue for perfect alignment.
+     */
+    private double computeEdgePixelDifference(BufferedImage img1, EdgeType e1,
+                                            BufferedImage img2, EdgeType e2) {
+
+        int[] strip1 = sampleCleanEdge(img1, e1);
+        int[] strip2 = sampleCleanEdge(img2, e2);
+
+        int len = Math.min(strip1.length, strip2.length);
+        if (len == 0) return Double.MAX_VALUE;
+
+        double sum = 0;
+        int count = 0;
+
+        for (int i = 0; i < len; i++) {
+            int c1 = strip1[i];
+            int c2 = strip2[i];
+
+            // skip background-ish
+            if (isBackgroundColor(c1) || isBackgroundColor(c2)) continue;
+
+            int r1 = (c1 >> 16) & 255;
+            int g1 = (c1 >> 8) & 255;
+            int b1 = (c1) & 255;
+
+            int r2 = (c2 >> 16) & 255;
+            int g2 = (c2 >> 8) & 255;
+            int b2 = (c2) & 255;
+
+            int dr = r1 - r2;
+            int dg = g1 - g2;
+            int db = b1 - b2;
+
+            sum += Math.sqrt(dr*dr + dg*dg + db*db);
+            count++;
+        }
+
+        if (count == 0) return Double.MAX_VALUE;
+
+        return sum / count;
+    }
+
+
     //--------------------------------------------------------------------
     // Combined RGB + Gradient Histogram Edge Matching (using clean edges)
     //--------------------------------------------------------------------
     public List<EdgeMatch> performEdgeMatching() {
         List<EdgeMatch> matches = new ArrayList<>();
-        System.out.println("Starting edge matching (clean RGB + Gradient)…");
+        System.out.println("Starting edge matching (clean RGB + Gradient + Pixel)…");
 
         for (int i = 0; i < pieces.size(); i++) {
             for (int j = i + 1; j < pieces.size(); j++) {
@@ -650,23 +741,28 @@ public class ImageDisplay {
                 for (EdgeType e1 : EdgeType.values()) {
                     EdgeType e2 = getComplementaryEdge(e1);
 
-                    // --- compute RGB histograms ---
+                    // Histogram distance
                     float[] rgb1 = computeEdgeHistogram(p1.image, e1);
                     float[] rgb2 = computeEdgeHistogram(p2.image, e2);
                     double rgbDist = histogramDistance(rgb1, rgb2);
 
-                    // --- compute gradient histograms ---
-                    float[] grad1 = computeGradientHistogram(p1.image, e1);
-                    float[] grad2 = computeGradientHistogram(p2.image, e2);
-                    double gradDist = gradientDistance(grad1, grad2);
+                    // Gradient distance
+                    float[] g1 = computeGradientHistogram(p1.image, e1);
+                    float[] g2 = computeGradientHistogram(p2.image, e2);
+                    double gradDist = gradientDistance(g1, g2);
 
-                    // --- combined score ---
-                    double finalScore = 0.4 * rgbDist + 0.6 * gradDist;
+                    // NEW: direct pixel comparison
+                    double pixelDist = computeEdgePixelDifference(p1.image, e1, p2.image, e2);
+
+                    // Final score — dominated by pixel match
+                    double score = pixelDist
+                                + 0.2 * rgbDist
+                                + 0.1 * gradDist;
 
                     matches.add(new EdgeMatch(
                             p1.id, e1,
                             p2.id, e2,
-                            finalScore
+                            score
                     ));
                 }
             }
@@ -674,13 +770,14 @@ public class ImageDisplay {
 
         Collections.sort(matches);
 
-        System.out.println("Top 10 combined matches:");
+        System.out.println("Top 10 matches:");
         for (int k = 0; k < Math.min(10, matches.size()); k++) {
             System.out.println(matches.get(k));
         }
 
         return matches;
     }
+
 
     // -------------------------------------------------------------------------
     // Build adjacency graph (mutual-best) and layout
