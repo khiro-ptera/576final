@@ -6,10 +6,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import javax.swing.*;
 
 public class ImageDisplay {
@@ -304,7 +306,7 @@ public class ImageDisplay {
             original.setRGB(lx, ly, imgOne.getRGB(sx, sy));
         }
 
-        // if ~0°, just crop and convert
+        // if ~0Â°, just crop and convert
         if (Math.abs(angleDegrees) < 1e-3) {
             BufferedImage cropped0 = cropToContent(original);
             return argbToRgb(cropped0);
@@ -724,13 +726,91 @@ public class ImageDisplay {
         return sum / count;
     }
 
+    /**
+     * Compute variance of an edge to detect "boring" edges
+     */
+    private double computeEdgeVariance(BufferedImage img, EdgeType edge) {
+        int[] strip = sampleCleanEdge(img, edge);
+        if (strip.length == 0) return 0;
+        
+        // Calculate variance of grayscale values
+        double[] grays = new double[strip.length];
+        double mean = 0;
+        
+        for (int i = 0; i < strip.length; i++) {
+            int rgb = strip[i];
+            int gray = ((rgb >> 16) & 255) + ((rgb >> 8) & 255) + (rgb & 255);
+            grays[i] = gray / 3.0;
+            mean += grays[i];
+        }
+        mean /= strip.length;
+        
+        double variance = 0;
+        for (double g : grays) {
+            variance += (g - mean) * (g - mean);
+        }
+        variance /= strip.length;
+        
+        return variance;
+    }
+
+    /**
+     * Check if an edge is "interesting" enough for reliable matching
+     */
+    private boolean isInterestingEdge(BufferedImage img, EdgeType edge) {
+        double variance = computeEdgeVariance(img, edge);
+        // Threshold: edges with variance < 100 are too uniform
+        return variance > 100.0;  // Adjust this threshold as needed
+    }
+
+    /**
+     * Enhanced spatial compatibility that considers rotation and actual positions.
+     */
+    private boolean areSpatiallyCompatibleEnhanced(PuzzlePiece p1, EdgeType e1, 
+                                                    PuzzlePiece p2, EdgeType e2) {
+        // Basic dimensional check
+        int w1 = p1.image.getWidth();
+        int h1 = p1.image.getHeight();
+        int w2 = p2.image.getWidth();
+        int h2 = p2.image.getHeight();
+        
+        int edgeLen1 = (e1 == EdgeType.TOP || e1 == EdgeType.BOTTOM) ? w1 : h1;
+        int edgeLen2 = (e2 == EdgeType.TOP || e2 == EdgeType.BOTTOM) ? w2 : h2;
+        
+        // For irregular pieces: require at least 30% overlap in edge length
+        int minLen = Math.min(edgeLen1, edgeLen2);
+        int maxLen = Math.max(edgeLen1, edgeLen2);
+        
+        if (maxLen > minLen * 3.5) {  // More lenient threshold
+            return false;
+        }
+        
+        // Check that pieces aren't absurdly different in size
+        int area1 = w1 * h1;
+        int area2 = w2 * h2;
+        
+        if (area1 == 0 || area2 == 0) return false;
+        
+        double areaRatio = (double) Math.max(area1, area2) / Math.min(area1, area2);
+        
+        // Allow up to 5x area difference for irregular pieces
+        if (areaRatio > 5.0) {
+            return false;
+        }
+        
+        return true;
+    }
 
     //--------------------------------------------------------------------
     // Combined RGB + Gradient Histogram Edge Matching (using clean edges)
     //--------------------------------------------------------------------
     public List<EdgeMatch> performEdgeMatching() {
         List<EdgeMatch> matches = new ArrayList<>();
-        System.out.println("Starting edge matching (clean RGB + Gradient + Pixel)…");
+        System.out.println("Starting edge matching with variance filtering…");
+
+        int skippedVariance = 0;
+        int skippedSpatial = 0;
+        int totalConsidered = 0;
 
         for (int i = 0; i < pieces.size(); i++) {
             for (int j = i + 1; j < pieces.size(); j++) {
@@ -740,39 +820,64 @@ public class ImageDisplay {
 
                 for (EdgeType e1 : EdgeType.values()) {
                     EdgeType e2 = getComplementaryEdge(e1);
+                    totalConsidered++;
 
-                    // Histogram distance
+                    // Spatial compatibility check (relaxed for irregular pieces)
+                    if (!areSpatiallyCompatibleEnhanced(p1, e1, p2, e2)) {
+                        skippedSpatial++;
+                        continue;
+                    }
+
+                    // Variance check
+                    double var1 = computeEdgeVariance(p1.image, e1);
+                    double var2 = computeEdgeVariance(p2.image, e2);
+                    
+                    // Skip if BOTH edges are too uniform (boring edges)
+                    if (var1 < 100 && var2 < 100) {
+                        skippedVariance++;
+                        continue;
+                    }
+
                     float[] rgb1 = computeEdgeHistogram(p1.image, e1);
                     float[] rgb2 = computeEdgeHistogram(p2.image, e2);
                     double rgbDist = histogramDistance(rgb1, rgb2);
 
-                    // Gradient distance
                     float[] g1 = computeGradientHistogram(p1.image, e1);
                     float[] g2 = computeGradientHistogram(p2.image, e2);
                     double gradDist = gradientDistance(g1, g2);
 
-                    // NEW: direct pixel comparison
                     double pixelDist = computeEdgePixelDifference(p1.image, e1, p2.image, e2);
 
-                    // Final score — dominated by pixel match
-                    double score = pixelDist
-                                + 0.2 * rgbDist
-                                + 0.1 * gradDist;
+                    // Adaptive weighting based on edge complexity
+                    double avgVar = (var1 + var2) / 2.0;
+                    
+                    double score = pixelDist + 0.2 * rgbDist + 0.1 * gradDist;
+                    
+                    // Penalty for low-variance matches (makes them less attractive)
+                    if (avgVar < 200) {
+                        score *= (1.0 + (200 - avgVar) / 400);
+                    }
 
-                    matches.add(new EdgeMatch(
-                            p1.id, e1,
-                            p2.id, e2,
-                            score
-                    ));
+                    matches.add(new EdgeMatch(p1.id, e1, p2.id, e2, score));
                 }
             }
         }
 
         Collections.sort(matches);
 
-        System.out.println("Top 10 matches:");
-        for (int k = 0; k < Math.min(10, matches.size()); k++) {
-            System.out.println(matches.get(k));
+        System.out.println("Matching statistics:");
+        System.out.println("  Total edge pairs considered: " + totalConsidered);
+        System.out.println("  Skipped due to spatial incompatibility: " + skippedSpatial);
+        System.out.println("  Skipped due to low variance: " + skippedVariance);
+        System.out.println("  Matches generated: " + matches.size());
+
+        System.out.println("\nTop 20 matches:");
+        for (int k = 0; k < Math.min(20, matches.size()); k++) {
+            EdgeMatch m = matches.get(k);
+            double var1 = computeEdgeVariance(pieces.get(m.piece1Id).image, m.edge1);
+            double var2 = computeEdgeVariance(pieces.get(m.piece2Id).image, m.edge2);
+            System.out.println(m + " [var: " + String.format("%.1f", var1) + 
+                            ", " + String.format("%.1f", var2) + "]");
         }
 
         return matches;
@@ -797,49 +902,59 @@ public class ImageDisplay {
     }
 
     public Map<Integer, Map<EdgeType, PlacementEdge>> buildAdjacencyGraph(List<EdgeMatch> matches) {
-
-        Map<Integer, Map<EdgeType, EdgeMatch>> bestFrom = new HashMap<>();
-        Map<Integer, Map<EdgeType, EdgeMatch>> bestTo = new HashMap<>();
-        for (PuzzlePiece p : pieces) {
-            bestFrom.put(p.id, new EnumMap<>(EdgeType.class));
-            bestTo.put(p.id, new EnumMap<>(EdgeType.class));
-        }
-
-        // find best outgoing (from) and incoming (to) match for each edge
-        for (EdgeMatch m : matches) {
-            Map<EdgeType, EdgeMatch> outMap = bestFrom.get(m.piece1Id);
-            EdgeMatch curOut = outMap.get(m.edge1);
-            if (curOut == null || m.score < curOut.score) {
-                outMap.put(m.edge1, m);
-            }
-
-            Map<EdgeType, EdgeMatch> inMap = bestTo.get(m.piece2Id);
-            EdgeMatch curIn = inMap.get(m.edge2);
-            if (curIn == null || m.score < curIn.score) {
-                inMap.put(m.edge2, m);
-            }
-        }
-
+        System.out.println("\n=== Building Adjacency Graph ===");
+        
         Map<Integer, Map<EdgeType, PlacementEdge>> graph = new HashMap<>();
         for (PuzzlePiece p : pieces) {
             graph.put(p.id, new EnumMap<>(EdgeType.class));
         }
-
-        // keep only mutual best matches
+        
+        // Track which edges are already used
+        Map<String, Boolean> usedEdges = new HashMap<>();
+        
+        int acceptedCount = 0;
+        double SCORE_THRESHOLD = 35.0;  // Only accept really good matches
+        
+        // Accept matches in order (best first) until all edges are assigned
         for (EdgeMatch m : matches) {
-            if (bestFrom.get(m.piece1Id).get(m.edge1) == m &&
-                bestTo.get(m.piece2Id).get(m.edge2) == m) {
-
-                graph.get(m.piece1Id).put(
-                        m.edge1,
-                        new PlacementEdge(m.piece1Id, m.piece2Id, m.edge1, m.score));
-
-                graph.get(m.piece2Id).put(
-                        m.edge2,
-                        new PlacementEdge(m.piece2Id, m.piece1Id, m.edge2, m.score));
+            // Skip matches with poor scores
+            if (m.score > SCORE_THRESHOLD) {
+                break;  // Since sorted, rest will be worse
             }
+            
+            String edge1Key = m.piece1Id + "_" + m.edge1;
+            String edge2Key = m.piece2Id + "_" + m.edge2;
+            
+            // Skip if either edge is already used
+            if (usedEdges.containsKey(edge1Key) || usedEdges.containsKey(edge2Key)) {
+                continue;
+            }
+            
+            // Add bidirectional connection
+            graph.get(m.piece1Id).put(m.edge1,
+                new PlacementEdge(m.piece1Id, m.piece2Id, m.edge1, m.score));
+            graph.get(m.piece2Id).put(m.edge2,
+                new PlacementEdge(m.piece2Id, m.piece1Id, m.edge2, m.score));
+            
+            usedEdges.put(edge1Key, true);
+            usedEdges.put(edge2Key, true);
+            acceptedCount++;
+            
+            System.out.println("Accepted: " + m);
         }
-
+        
+        System.out.println("Total connections accepted: " + acceptedCount);
+        System.out.println("\nPiece connectivity:");
+        for (int id = 0; id < pieces.size(); id++) {
+            Map<EdgeType, PlacementEdge> neighbors = graph.get(id);
+            System.out.print("Piece " + id + " (" + neighbors.size() + " edges): ");
+            for (EdgeType edge : neighbors.keySet()) {
+                PlacementEdge pe = neighbors.get(edge);
+                System.out.print(edge + "→" + pe.toPiece + " ");
+            }
+            System.out.println();
+        }
+        
         return graph;
     }
 
@@ -902,6 +1017,133 @@ public class ImageDisplay {
         }
 
         return pos;
+    }
+
+    /**
+     * Second pass: try to place pieces that weren't connected in the initial graph
+     */
+    public void placeRemainingPieces(Map<Integer, GridPos> layout, 
+                                    Map<Integer, Map<EdgeType, PlacementEdge>> graph) {
+        System.out.println("\n=== Placing Remaining Pieces ===");
+        
+        // Find unplaced pieces
+        List<Integer> unplaced = new ArrayList<>();
+        for (int id = 0; id < pieces.size(); id++) {
+            if (!layout.containsKey(id)) {
+                unplaced.add(id);
+            }
+        }
+        
+        if (unplaced.isEmpty()) {
+            System.out.println("All pieces already placed!");
+            return;
+        }
+        
+        System.out.println("Unplaced pieces: " + unplaced);
+        
+        // Find empty positions in the grid
+        Set<String> occupiedPositions = new HashSet<>();
+        for (GridPos gp : layout.values()) {
+            occupiedPositions.add(gp.row + "," + gp.col);
+        }
+        
+        // Try to place each unplaced piece
+        for (int pieceId : unplaced) {
+            System.out.println("\nTrying to place piece " + pieceId);
+            
+            double bestScore = Double.MAX_VALUE;
+            GridPos bestPos = null;
+            
+            // Try all empty positions adjacent to placed pieces
+            for (Map.Entry<Integer, GridPos> entry : layout.entrySet()) {
+                int placedId = entry.getKey();
+                GridPos placedPos = entry.getValue();
+                
+                // Check all 4 adjacent positions
+                int[][] deltas = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+                EdgeType[] directions = {EdgeType.TOP, EdgeType.BOTTOM, EdgeType.LEFT, EdgeType.RIGHT};
+                
+                for (int i = 0; i < 4; i++) {
+                    int newRow = placedPos.row + deltas[i][0];
+                    int newCol = placedPos.col + deltas[i][1];
+                    String posKey = newRow + "," + newCol;
+                    
+                    // Skip if position is occupied
+                    if (occupiedPositions.contains(posKey)) {
+                        continue;
+                    }
+                    
+                    // Score this placement by checking how well it matches neighbors
+                    double score = scorePositionForPiece(pieceId, newRow, newCol, layout);
+                    
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestPos = new GridPos(newRow, newCol);
+                    }
+                }
+            }
+            
+            if (bestPos != null) {
+                layout.put(pieceId, bestPos);
+                occupiedPositions.add(bestPos.row + "," + bestPos.col);
+                System.out.println("Placed piece " + pieceId + " at (" + 
+                                bestPos.row + "," + bestPos.col + ") with score " + 
+                                String.format("%.2f", bestScore));
+            } else {
+                System.out.println("Could not find position for piece " + pieceId);
+            }
+        }
+    }
+
+    /**
+     * Score how well a piece fits at a given position based on its neighbors
+     */
+    private double scorePositionForPiece(int pieceId, int row, int col, 
+                                        Map<Integer, GridPos> layout) {
+        PuzzlePiece piece = pieces.get(pieceId);
+        
+        double totalScore = 0;
+        int neighborCount = 0;
+        
+        // Check all 4 directions
+        int[][] deltas = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+        EdgeType[] pieceEdges = {EdgeType.TOP, EdgeType.BOTTOM, EdgeType.LEFT, EdgeType.RIGHT};
+        EdgeType[] neighborEdges = {EdgeType.BOTTOM, EdgeType.TOP, EdgeType.RIGHT, EdgeType.LEFT};
+        
+        for (int i = 0; i < 4; i++) {
+            int neighborRow = row + deltas[i][0];
+            int neighborCol = col + deltas[i][1];
+            
+            // Find piece at this neighbor position
+            int neighborId = -1;
+            for (Map.Entry<Integer, GridPos> entry : layout.entrySet()) {
+                GridPos gp = entry.getValue();
+                if (gp.row == neighborRow && gp.col == neighborCol) {
+                    neighborId = entry.getKey();
+                    break;
+                }
+            }
+            
+            if (neighborId != -1) {
+                // Score the edge match
+                PuzzlePiece neighbor = pieces.get(neighborId);
+                
+                double pixelDist = computeEdgePixelDifference(
+                    piece.image, pieceEdges[i],
+                    neighbor.image, neighborEdges[i]);
+                
+                float[] rgb1 = computeEdgeHistogram(piece.image, pieceEdges[i]);
+                float[] rgb2 = computeEdgeHistogram(neighbor.image, neighborEdges[i]);
+                double rgbDist = histogramDistance(rgb1, rgb2);
+                
+                double edgeScore = pixelDist + 0.2 * rgbDist;
+                totalScore += edgeScore;
+                neighborCount++;
+            }
+        }
+        
+        // Average score across neighbors (or high penalty if no neighbors)
+        return neighborCount > 0 ? totalScore / neighborCount : 1000.0;
     }
 
     public void showReconstructedPuzzle(Map<Integer, GridPos> layout) {
@@ -997,6 +1239,9 @@ public class ImageDisplay {
         List<EdgeMatch> matches = iq.performEdgeMatching();
         Map<Integer, Map<EdgeType, PlacementEdge>> graph = iq.buildAdjacencyGraph(matches);
         Map<Integer, GridPos> layout = iq.computeLayoutFromGraph(graph);
+
+        // NEW: Second pass to place remaining pieces
+        iq.placeRemainingPieces(layout, graph);
 
         iq.showReconstructedPuzzle(layout);
     }
