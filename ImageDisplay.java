@@ -244,46 +244,126 @@ public class ImageDisplay {
         return bestAngle;
     }
 
+    /**
+     * Advanced anti-aliasing + edge healing for rotated puzzle pieces.
+     *
+     * Pipeline:
+     *   1. Light Gaussian blur to remove rotation staircasing artifacts
+     *   2. Bicubic downsample → upsample for smoothing
+     *   3. Edge strip regression: rebuilds the outer 2 pixels using
+     *      the predicted color from a 5px inward strip.
+     */
     private BufferedImage cleanBorderInpaint(BufferedImage img) {
         int w = img.getWidth();
         int h = img.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
 
-        // Copy original first
-        Graphics2D g = out.createGraphics();
-        g.drawImage(img, 0, 0, null);
-        g.dispose();
+        // -------------------------
+        // 1. Gaussian blur (3x3)
+        // -------------------------
+        float[] gaussian = {
+                1f/16, 2f/16, 1f/16,
+                2f/16, 4f/16, 2f/16,
+                1f/16, 2f/16, 1f/16
+        };
+        ConvolveOp blur = new ConvolveOp(new Kernel(3, 3, gaussian),
+                ConvolveOp.EDGE_NO_OP, null);
+        BufferedImage blurred = blur.filter(img, null);
 
-        // Top edge
+        // -------------------------
+        // 2. Bicubic downsample → upsample
+        //    This kills subpixel aliasing from rotation
+        // -------------------------
+        int dsW = Math.max(1, w / 2);
+        int dsH = Math.max(1, h / 2);
+
+        BufferedImage ds = new BufferedImage(dsW, dsH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g1 = ds.createGraphics();
+        g1.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g1.drawImage(blurred, 0, 0, dsW, dsH, null);
+        g1.dispose();
+
+        BufferedImage smooth = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2 = smooth.createGraphics();
+        g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g2.drawImage(ds, 0, 0, w, h, null);
+        g2.dispose();
+
+        // -------------------------
+        // 3. Edge strip regression
+        // -------------------------
+        final int STRIP = 5;  // look inward 5 pixels (safe after blur)
+
+        // TOP edge
         for (int x = 0; x < w; x++) {
-            int safe = out.getRGB(x, Math.min(2, h-1));
-            out.setRGB(x, 0, safe);
-            if (h > 1) out.setRGB(x, 1, safe);
+            int sumR=0,sumG=0,sumB=0,count=0;
+            for (int dy=1; dy<=STRIP && dy<h; dy++) {
+                int rgb = smooth.getRGB(x, dy);
+                sumR += (rgb>>16)&255;
+                sumG += (rgb>>8)&255;
+                sumB += rgb&255;
+                count++;
+            }
+            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
+            int rgb = (pr<<16)|(pg<<8)|pb;
+            smooth.setRGB(x, 0, rgb);
+            if (h>1) smooth.setRGB(x, 1, rgb);
         }
 
-        // Bottom edge
+        // BOTTOM
         for (int x = 0; x < w; x++) {
-            int safe = out.getRGB(x, Math.max(h-3, 0));
-            out.setRGB(x, h-1, safe);
-            if (h > 1) out.setRGB(x, h-2, safe);
+            int sumR=0,sumG=0,sumB=0,count=0;
+            for (int dy=1; dy<=STRIP && dy<h; dy++) {
+                int y = h-1-dy;
+                int rgb = smooth.getRGB(x, y);
+                sumR += (rgb>>16)&255;
+                sumG += (rgb>>8)&255;
+                sumB += rgb&255;
+                count++;
+            }
+            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
+            int rgb = (pr<<16)|(pg<<8)|pb;
+            smooth.setRGB(x, h-1, rgb);
+            if (h>1) smooth.setRGB(x, h-2, rgb);
         }
 
-        // Left edge
+        // LEFT
         for (int y = 0; y < h; y++) {
-            int safe = out.getRGB(Math.min(2,w-1), y);
-            out.setRGB(0, y, safe);
-            if (w > 1) out.setRGB(1, y, safe);
+            int sumR=0,sumG=0,sumB=0,count=0;
+            for (int dx=1; dx<=STRIP && dx<w; dx++) {
+                int rgb = smooth.getRGB(dx, y);
+                sumR += (rgb>>16)&255;
+                sumG += (rgb>>8)&255;
+                sumB += rgb&255;
+                count++;
+            }
+            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
+            int rgb = (pr<<16)|(pg<<8)|pb;
+            smooth.setRGB(0, y, rgb);
+            if (w>1) smooth.setRGB(1, y, rgb);
         }
 
-        // Right edge
+        // RIGHT
         for (int y = 0; y < h; y++) {
-            int safe = out.getRGB(Math.max(w-3,0), y);
-            out.setRGB(w-1, y, safe);
-            if (w > 1) out.setRGB(w-2, y, safe);
+            int sumR=0,sumG=0,sumB=0,count=0;
+            for (int dx=1; dx<=STRIP && dx<w; dx++) {
+                int x = w-1-dx;
+                int rgb = smooth.getRGB(x, y);
+                sumR += (rgb>>16)&255;
+                sumG += (rgb>>8)&255;
+                sumB += rgb&255;
+                count++;
+            }
+            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
+            int rgb = (pr<<16)|(pg<<8)|pb;
+            smooth.setRGB(w-1, y, rgb);
+            if (w>1) smooth.setRGB(w-2, y, rgb);
         }
 
-        return out;
+        return smooth;
     }
+
 
 
     private BufferedImage extractAndRotatePiece(List<Point> pixels,
@@ -1007,14 +1087,14 @@ public class ImageDisplay {
         }
         
         Map<String, Boolean> usedEdges = new HashMap<>();
+        Set<String> connectedPairs = new HashSet<>();  // NEW: Track piece-pair connections
         
-        // Determine threshold adaptively based on score distribution
         double threshold = determineScoreThreshold(matches);
         System.out.println("Using adaptive threshold: " + String.format("%.2f", threshold));
         
         int acceptedCount = 0;
-        int minConnections = pieces.size() - 1;  // Need at least a spanning tree
-        int maxConnections = pieces.size() * 2;  // But don't accept too many
+        int minConnections = pieces.size() - 1;
+        int maxConnections = pieces.size() * 2;
         
         for (EdgeMatch m : matches) {
             String edge1Key = m.piece1Id + "_" + m.edge1;
@@ -1025,10 +1105,15 @@ public class ImageDisplay {
                 continue;
             }
             
-            // Accept if score is good OR we don't have minimum connections yet
+            // NEW: Check if these two pieces are already connected
+            String pairKey1 = Math.min(m.piece1Id, m.piece2Id) + "-" + 
+                            Math.max(m.piece1Id, m.piece2Id);
+            if (connectedPairs.contains(pairKey1)) {
+                continue;  // Skip - these pieces already have a connection
+            }
+            
             boolean acceptMatch = (m.score <= threshold) || (acceptedCount < minConnections);
             
-            // But stop if we have enough connections and score is getting bad
             if (acceptedCount >= maxConnections) {
                 break;
             }
@@ -1045,6 +1130,7 @@ public class ImageDisplay {
             
             usedEdges.put(edge1Key, true);
             usedEdges.put(edge2Key, true);
+            connectedPairs.add(pairKey1);  // NEW: Mark this pair as connected
             acceptedCount++;
             
             if (acceptedCount <= 20) {
