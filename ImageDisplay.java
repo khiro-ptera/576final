@@ -1,10 +1,9 @@
 import java.awt.*;
+import java.awt.geom.*;
 import java.awt.image.*;
 import java.io.*;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -32,6 +31,14 @@ public class ImageDisplay {
         Rectangle bounds;      // original bounding box in source image
         int id;
         double rotationAngle;  // angle (in degrees) applied to make it axis-aligned
+        
+        // For puzzle solving
+        Point initialPosition = new Point(0, 0);   // (x, y) for center of tile
+        Point finalPosition = new Point(0, 0);
+        int gridRow = 0, gridCol = 0;              // grid position after solving
+        double initialRotation = 0;
+        double finalRotation = 0;
+        int additionalRotation = 0;                // Additional 90° rotations needed (0, 90, 180, 270)
 
         PuzzlePiece(BufferedImage image, Rectangle bounds, int id) {
             this.image = image;
@@ -40,15 +47,79 @@ public class ImageDisplay {
             this.rotationAngle = 0;
         }
     }
+    
+    // Edge types for matching
+    enum EdgeType {
+        TOP, BOTTOM, LEFT, RIGHT
+    }
+    
+    // Class to represent an edge match between two pieces
+    static class EdgeMatch implements Comparable<EdgeMatch> {
+        int piece1;
+        int piece2;
+        EdgeType edge1;
+        EdgeType edge2;
+        double score;
+        
+        EdgeMatch(int piece1, int piece2, EdgeType edge1, EdgeType edge2, double score) {
+            this.piece1 = piece1;
+            this.piece2 = piece2;
+            this.edge1 = edge1;
+            this.edge2 = edge2;
+            this.score = score;
+        }
+        
+        @Override
+        public int compareTo(EdgeMatch other) {
+            return Double.compare(other.score, this.score);  // Higher scores first
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("Piece %d (%s) <-> Piece %d (%s): %.4f",
+                    piece1, edge1, piece2, edge2, score);
+        }
+    }
+    
+    // Placement edge connecting two pieces
+    static class PlacementEdge {
+        int otherId;
+        EdgeType otherEdge;
+        double score;
+        
+        PlacementEdge(int otherId, EdgeType otherEdge, double score) {
+            this.otherId = otherId;
+            this.otherEdge = otherEdge;
+            this.score = score;
+        }
+    }
+    
+    // Grid position for a piece
+    static class GridPos {
+        int row, col;
+        GridPos(int row, int col) {
+            this.row = row;
+            this.col = col;
+        }
+        
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof GridPos)) return false;
+            GridPos gp = (GridPos) o;
+            return row == gp.row && col == gp.col;
+        }
+        
+        @Override
+        public int hashCode() {
+            return row * 31 + col;
+        }
+    }
 
     // ~~~~~~~~~~~~~~~
     // Basic I/O
     public void readImageRGB(int width, int height, String imgPath, BufferedImage img) {
-        try {
+        try (RandomAccessFile raf = new RandomAccessFile(imgPath, "r")) {
             int frameLength = width * height * 3;
-            File file = new File(imgPath);
-            RandomAccessFile raf = new RandomAccessFile(file, "r");
-            raf.seek(0);
             byte[] bytes = new byte[frameLength];
             raf.read(bytes);
 
@@ -63,9 +134,8 @@ public class ImageDisplay {
                     ind++;
                 }
             }
-            raf.close();
         } catch (Exception e) {
-            e.printStackTrace();
+            System.err.println("Error reading image: " + e.getMessage());
         }
     }
 
@@ -184,21 +254,25 @@ public class ImageDisplay {
             localPixels.add(new Point(lx, ly));
         }
 
-        double rotationAngle = detectRotation(localPixels);
+        // Use minimum area rectangle approach like Python
+        double rotationAngle = detectRotationFromContour(piecePixels, bounds);
         BufferedImage pieceImage = extractAndRotatePiece(localPixels, bounds, rotationAngle);
 
         PuzzlePiece piece = new PuzzlePiece(pieceImage, bounds, id);
         piece.rotationAngle = rotationAngle;
+        piece.initialPosition = new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        piece.initialRotation = rotationAngle;
         return piece;
     }
 
     /**
-     * Brute-force orientation finder: for angles in [-89, 89],
-     * rotate all local pixels and choose the angle that minimizes
-     * the area of the bounding rectangle. This tends to align
-     * the piece edges with the axes, which is what we want.
+     * Detect rotation using minimum area rectangle approach (mimics Python's minAreaRect).
+     * Analyzes corner positions to determine correct orientation like Python does.
      */
-    private double detectRotation(List<Point> pixels) {
+    private double detectRotationFromContour(List<Point> pixels, Rectangle bounds) {
+        if (pixels.isEmpty()) return 0.0;
+        
+        // Find the minimum area rectangle
         int n = pixels.size();
         double[] xs = new double[n];
         double[] ys = new double[n];
@@ -210,7 +284,9 @@ public class ImageDisplay {
 
         double bestAngle = 0.0;
         double bestArea = Double.MAX_VALUE;
+        double bestWidth = 0, bestHeight = 0;
 
+        // Try angles to find minimum area rectangle
         for (double angle = -89.0; angle <= 89.0; angle += 1.0) {
             double rad = Math.toRadians(angle);
             double cos = Math.cos(rad);
@@ -238,189 +314,66 @@ public class ImageDisplay {
             if (area < bestArea) {
                 bestArea = area;
                 bestAngle = angle;
+                bestWidth = w;
+                bestHeight = h;
             }
         }
-
+        
+        // PYTHON LOGIC: Use corner analysis to determine correct orientation
+        // Python uses cv2.boxPoints() on the min-area-rect, sorts by y-coordinate,
+        // then checks if coords[2][0] < coords[0][0] to add 90° if needed
+        
+        // For our min-area-rect at bestAngle, compute the 4 corners
+        double rad = Math.toRadians(bestAngle);
+        double cos = Math.cos(rad);
+        double sin = Math.sin(rad);
+        
+        // Find bounds in rotated coordinate system
+        double minX = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        
+        for (int i = 0; i < n; i++) {
+            double rx = xs[i] * cos - ys[i] * sin;
+            double ry = xs[i] * sin + ys[i] * cos;
+            if (rx < minX) minX = rx;
+            if (rx > maxX) maxX = rx;
+            if (ry < minY) minY = ry;
+            if (ry > maxY) maxY = ry;
+        }
+        
+        // 4 corners of minimum area rectangle in rotated coords
+        // Then transform back to original coords
+        Point2D.Double[] corners = new Point2D.Double[4];
+        double[][] rotCorners = {
+            {minX, minY}, {maxX, minY}, {maxX, maxY}, {minX, maxY}
+        };
+        
+        for (int i = 0; i < 4; i++) {
+            double rx = rotCorners[i][0];
+            double ry = rotCorners[i][1];
+            double ox = rx * cos + ry * sin;  // rotate back
+            double oy = -rx * sin + ry * cos;
+            corners[i] = new Point2D.Double(ox, oy);
+        }
+        
+        // Sort corners by y-coordinate (like Python)
+        Point2D.Double[] sortedCorners = corners.clone();
+        java.util.Arrays.sort(sortedCorners, (c1, c2) -> Double.compare(c1.y, c2.y));
+        
+        // Python logic: if coords[2][0] < coords[0][0], add 90°
+        // (This checks if the 3rd-smallest-y corner is to the left of the 1st-smallest-y corner)
+        if (sortedCorners[2].x < sortedCorners[0].x) {
+            bestAngle += 90;
+        }
+        
+        // Normalize to [-45, 45] range
+        while (bestAngle > 45) bestAngle -= 90;
+        while (bestAngle < -45) bestAngle += 90;
+        
         return bestAngle;
     }
-
-    /**
-     * Advanced anti-aliasing + edge healing for rotated puzzle pieces. TOO BLURRY
-     *
-     * Pipeline:
-     *   1. Light Gaussian blur to remove rotation staircasing artifacts
-     *   2. Bicubic downsample → upsample for smoothing
-     *   3. Edge strip regression: rebuilds the outer 2 pixels using
-     *      the predicted color from a 5px inward strip.
-     */
-    /**
-     * Advanced edge healing for rotated pieces.
-     * Strategy: Use median filtering + aggressive inpainting to preserve edge sharpness
-     * while removing rotation artifacts.
-     */
-    private BufferedImage cleanBorderInpaint(BufferedImage img) {
-        int w = img.getWidth();
-        int h = img.getHeight();
-        
-        // -------------------------
-        // 1. Apply 3x3 median filter to kill rotation noise
-        //    (preserves edges better than Gaussian)
-        // -------------------------
-        BufferedImage median = applyMedianFilter(img, 3);
-        
-        // -------------------------
-        // 2. Aggressive edge reconstruction:
-        //    Sample 8-12 pixels inward (deep enough to avoid artifacts)
-        //    Use LINEAR regression to predict edge colors
-        // -------------------------
-        final int SAMPLE_DEPTH = 10;  // Look 10 pixels inward
-        final int REPLACE_DEPTH = 3;   // Replace outer 3 pixels
-        
-        BufferedImage cleaned = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = cleaned.createGraphics();
-        g.drawImage(median, 0, 0, null);
-        g.dispose();
-        
-        // TOP edge
-        for (int x = 0; x < w; x++) {
-            int[] colors = new int[SAMPLE_DEPTH];
-            int count = 0;
-            for (int dy = REPLACE_DEPTH; dy < REPLACE_DEPTH + SAMPLE_DEPTH && dy < h; dy++) {
-                colors[count++] = cleaned.getRGB(x, dy);
-            }
-            if (count > 0) {
-                int predictedColor = extrapolateColor(colors, count, -1);
-                for (int dy = 0; dy < REPLACE_DEPTH && dy < h; dy++) {
-                    cleaned.setRGB(x, dy, predictedColor);
-                }
-            }
-        }
-        
-        // BOTTOM edge
-        for (int x = 0; x < w; x++) {
-            int[] colors = new int[SAMPLE_DEPTH];
-            int count = 0;
-            for (int dy = REPLACE_DEPTH; dy < REPLACE_DEPTH + SAMPLE_DEPTH && dy < h; dy++) {
-                int y = h - 1 - dy;
-                colors[count++] = cleaned.getRGB(x, y);
-            }
-            if (count > 0) {
-                int predictedColor = extrapolateColor(colors, count, -1);
-                for (int dy = 0; dy < REPLACE_DEPTH && dy < h; dy++) {
-                    cleaned.setRGB(x, h - 1 - dy, predictedColor);
-                }
-            }
-        }
-        
-        // LEFT edge
-        for (int y = 0; y < h; y++) {
-            int[] colors = new int[SAMPLE_DEPTH];
-            int count = 0;
-            for (int dx = REPLACE_DEPTH; dx < REPLACE_DEPTH + SAMPLE_DEPTH && dx < w; dx++) {
-                colors[count++] = cleaned.getRGB(dx, y);
-            }
-            if (count > 0) {
-                int predictedColor = extrapolateColor(colors, count, -1);
-                for (int dx = 0; dx < REPLACE_DEPTH && dx < w; dx++) {
-                    cleaned.setRGB(dx, y, predictedColor);
-                }
-            }
-        }
-        
-        // RIGHT edge
-        for (int y = 0; y < h; y++) {
-            int[] colors = new int[SAMPLE_DEPTH];
-            int count = 0;
-            for (int dx = REPLACE_DEPTH; dx < REPLACE_DEPTH + SAMPLE_DEPTH && dx < w; dx++) {
-                int x = w - 1 - dx;
-                colors[count++] = cleaned.getRGB(x, y);
-            }
-            if (count > 0) {
-                int predictedColor = extrapolateColor(colors, count, -1);
-                for (int dx = 0; dx < REPLACE_DEPTH && dx < w; dx++) {
-                    cleaned.setRGB(w - 1 - dx, y, predictedColor);
-                }
-            }
-        }
-        
-        return cleaned;
-    }
-
-    /**
-     * Apply median filter to remove rotation noise while preserving edges
-     */
-    private BufferedImage applyMedianFilter(BufferedImage img, int size) {
-        int w = img.getWidth();
-        int h = img.getHeight();
-        BufferedImage result = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        
-        int half = size / 2;
-        int[] rValues = new int[size * size];
-        int[] gValues = new int[size * size];
-        int[] bValues = new int[size * size];
-        
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int count = 0;
-                
-                // Collect neighborhood
-                for (int dy = -half; dy <= half; dy++) {
-                    for (int dx = -half; dx <= half; dx++) {
-                        int nx = x + dx;
-                        int ny = y + dy;
-                        
-                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                            int rgb = img.getRGB(nx, ny);
-                            rValues[count] = (rgb >> 16) & 0xFF;
-                            gValues[count] = (rgb >> 8) & 0xFF;
-                            bValues[count] = rgb & 0xFF;
-                            count++;
-                        }
-                    }
-                }
-                
-                // Find median
-                Arrays.sort(rValues, 0, count);
-                Arrays.sort(gValues, 0, count);
-                Arrays.sort(bValues, 0, count);
-                
-                int medianR = rValues[count / 2];
-                int medianG = gValues[count / 2];
-                int medianB = bValues[count / 2];
-                
-                result.setRGB(x, y, (medianR << 16) | (medianG << 8) | medianB);
-            }
-        }
-        
-        return result;
-    }
-
-    /**
-     * Extrapolate edge color using nearest neighbor with slight smoothing
-     * direction: -1 for inward extrapolation
-     */
-    private int extrapolateColor(int[] colors, int count, int direction) {
-        if (count == 0) return 0;
-        
-        // Use weighted average of first 3-5 samples (closest to edge)
-        int useCount = Math.min(5, count);
-        long sumR = 0, sumG = 0, sumB = 0;
-        
-        for (int i = 0; i < useCount; i++) {
-            int rgb = colors[i];
-            sumR += (rgb >> 16) & 0xFF;
-            sumG += (rgb >> 8) & 0xFF;
-            sumB += rgb & 0xFF;
-        }
-        
-        int avgR = (int) (sumR / useCount);
-        int avgG = (int) (sumG / useCount);
-        int avgB = (int) (sumB / useCount);
-        
-        return (avgR << 16) | (avgG << 8) | avgB;
-    }
-
-
 
     private BufferedImage extractAndRotatePiece(List<Point> pixels,
                                                 Rectangle bounds,
@@ -438,7 +391,7 @@ public class ImageDisplay {
             original.setRGB(lx, ly, imgOne.getRGB(sx, sy));
         }
 
-        // if ~0Â°, just crop and convert
+        // if ~0°, just crop and convert
         if (Math.abs(angleDegrees) < 1e-3) {
             BufferedImage cropped0 = cropToContent(original);
             return argbToRgb(cropped0);
@@ -466,12 +419,44 @@ public class ImageDisplay {
         g2d.drawImage(original, 0, 0, null);
         g2d.dispose();
 
+        // Remove 1-pixel border from rotation artifacts (like Python's tile_img[1:-1, 1:-1])
         BufferedImage cropped = cropToContent(rotated);
-        BufferedImage rgb = argbToRgb(cropped);
-
-        rgb = cleanBorderInpaint(rgb);
+        
+        // Clean anti-aliased edges by removing low-alpha pixels at boundaries
+        BufferedImage cleaned = cleanBorders(cropped);
+        
+        BufferedImage rgb = argbToRgb(cleaned);
 
         return rgb;
+    }
+    
+    /**
+     * Clean anti-aliased borders by removing anti-aliasing artifacts.
+     * Mimics Python's tile_img[1:-1, 1:-1] which removes 1 pixel from each edge.
+     * This removes the fuzzy black edges created by bilinear interpolation during rotation.
+     */
+    private BufferedImage cleanBorders(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        
+        // If image is too small to crop, return as-is
+        if (w <= 2 || h <= 2) {
+            return img;
+        }
+        
+        // Crop exactly 1 pixel from each side, like Python's [1:-1, 1:-1]
+        int newW = w - 2;
+        int newH = h - 2;
+        
+        BufferedImage cleaned = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 1; y < h - 1; y++) {
+            for (int x = 1; x < w - 1; x++) {
+                int argb = img.getRGB(x, y);
+                cleaned.setRGB(x - 1, y - 1, argb);
+            }
+        }
+        
+        return cleaned;
     }
 
     private BufferedImage cropToContent(BufferedImage img) {
@@ -517,7 +502,688 @@ public class ImageDisplay {
     }
 
     // ~~~~~~~~~~~~~~~
+    // Simple MSE-based Edge Matching (from Python solution)
+    
+    /**
+     * Extract edge pixels from an image for a given edge type.
+     * Matches Python behavior: extract from the actual border pixels,
+     * assuming the image has already been cleaned of anti-aliasing.
+     * Returns flattened RGB values [r1,g1,b1,r2,g2,b2,...] for MSE calculation.
+     */
+    private int[] extractEdgePixels(BufferedImage img, EdgeType edge) {
+        int h = img.getHeight();
+        int w = img.getWidth();
+        int[] pixels = null;
+        
+        switch (edge) {
+            case TOP:
+                pixels = new int[w * 3];  // RGB channels
+                for (int x = 0; x < w; x++) {
+                    int rgb = img.getRGB(x, 0);
+                    pixels[x * 3] = (rgb >> 16) & 0xFF;     // R
+                    pixels[x * 3 + 1] = (rgb >> 8) & 0xFF;  // G
+                    pixels[x * 3 + 2] = rgb & 0xFF;         // B
+                }
+                break;
+            case BOTTOM:
+                pixels = new int[w * 3];
+                for (int x = 0; x < w; x++) {
+                    int rgb = img.getRGB(x, h - 1);
+                    pixels[x * 3] = (rgb >> 16) & 0xFF;
+                    pixels[x * 3 + 1] = (rgb >> 8) & 0xFF;
+                    pixels[x * 3 + 2] = rgb & 0xFF;
+                }
+                break;
+            case LEFT:
+                pixels = new int[h * 3];
+                for (int y = 0; y < h; y++) {
+                    int rgb = img.getRGB(0, y);
+                    pixels[y * 3] = (rgb >> 16) & 0xFF;
+                    pixels[y * 3 + 1] = (rgb >> 8) & 0xFF;
+                    pixels[y * 3 + 2] = rgb & 0xFF;
+                }
+                break;
+            case RIGHT:
+                pixels = new int[h * 3];
+                for (int y = 0; y < h; y++) {
+                    int rgb = img.getRGB(w - 1, y);
+                    pixels[y * 3] = (rgb >> 16) & 0xFF;
+                    pixels[y * 3 + 1] = (rgb >> 8) & 0xFF;
+                    pixels[y * 3 + 2] = rgb & 0xFF;
+                }
+                break;
+        }
+        return pixels;
+    }
+    
+    /**
+     * Compute Mean Squared Error between two edges.
+     * Lower = better match. Returns negative MSE so higher is better.
+     */
+    private double computeEdgeSimilarity(int[] edge1, int[] edge2) {
+        int len1 = edge1.length;
+        int len2 = edge2.length;
+        
+        // Resample edge2 to match edge1 length if needed
+        int[] edge2Resized = edge2;
+        if (len1 != len2) {
+            edge2Resized = resampleEdgePixels(edge2, len1);
+        }
+        
+        // Compute MSE (edges already have separate RGB channels)
+        double sumSqDiff = 0.0;
+        for (int i = 0; i < len1; i++) {
+            int diff = edge1[i] - edge2Resized[i];
+            sumSqDiff += diff * diff;
+        }
+        double mse = sumSqDiff / len1;
+        
+        return -mse;  // Negative so higher is better
+    }
+    
+    /**
+     * Resample edge pixels to a new length using nearest neighbor.
+     * Input/output are flattened RGB arrays.
+     */
+    private int[] resampleEdgePixels(int[] edge, int newLen) {
+        int[] resampled = new int[newLen];
+        if (newLen <= 0) return resampled;
+        
+        for (int i = 0; i < newLen; i++) {
+            double ratio = i / (double) (newLen - 1);
+            int srcIdx = (int) Math.round(ratio * (edge.length - 1));
+            srcIdx = Math.min(srcIdx, edge.length - 1);
+            resampled[i] = edge[srcIdx];
+        }
+        
+        return resampled;
+    }
+    
+    /**
+     * Check if two edges can be adjacent based on direction.
+     */
+    private boolean areEdgesCompatible(EdgeType e1, EdgeType e2) {
+        return (e1 == EdgeType.TOP && e2 == EdgeType.BOTTOM) ||
+               (e1 == EdgeType.BOTTOM && e2 == EdgeType.TOP) ||
+               (e1 == EdgeType.LEFT && e2 == EdgeType.RIGHT) ||
+               (e1 == EdgeType.RIGHT && e2 == EdgeType.LEFT);
+    }
+    
+    /**
+     * Perform edge matching between all pieces using MSE-based algorithm.
+     * Returns list of potential matches sorted by score (higher is better).
+     */
+    public List<EdgeMatch> performEdgeMatching() {
+        List<EdgeMatch> matches = new ArrayList<>();
+        System.out.println("Starting MSE-based edge matching...");
+        
+        int n = pieces.size();
+        
+        // For each pair of pieces, find the best matching edges
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                
+                PuzzlePiece p1 = pieces.get(i);
+                PuzzlePiece p2 = pieces.get(j);
+                
+                double bestScore = Double.NEGATIVE_INFINITY;
+                EdgeType bestEdge1 = null;
+                EdgeType bestEdge2 = null;
+                
+                // Try all edge combinations from p1
+                for (EdgeType e1 : EdgeType.values()) {
+                    int[] edge1Pixels = extractEdgePixels(p1.image, e1);
+                    
+                    // Try all edge combinations from p2
+                    for (EdgeType e2 : EdgeType.values()) {
+                        // Check directional compatibility
+                        if (!areEdgesCompatible(e1, e2)) {
+                            continue;
+                        }
+                        
+                        int[] edge2Pixels = extractEdgePixels(p2.image, e2);
+                        double score = computeEdgeSimilarity(edge1Pixels, edge2Pixels);
+                        
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestEdge1 = e1;
+                            bestEdge2 = e2;
+                        }
+                    }
+                }
+                
+                if (bestEdge1 != null && bestEdge2 != null) {
+                    matches.add(new EdgeMatch(i, j, bestEdge1, bestEdge2, bestScore));
+                }
+            }
+        }
+        
+        // Sort by score (highest first)
+        Collections.sort(matches);
+        
+        System.out.println("Generated " + matches.size() + " potential matches");
+        System.out.println("\nTop 20 matches:");
+        for (int k = 0; k < Math.min(20, matches.size()); k++) {
+            EdgeMatch m = matches.get(k);
+            System.out.println("  " + m);
+        }
+        
+        return matches;
+    }
+
+    // ~~~~~~~~~~~~~~~
+    // Puzzle Assembly (from Python algorithm)
+    
+    /**
+     * Compute layout from edge matches, starting with best pair (like Python algorithm).
+     * Uses grid coordinates (col, row) where col is x and row is y.
+     */
+    public Map<Integer, GridPos> computeLayoutFromGraph(List<EdgeMatch> matches) {
+        Map<Integer, GridPos> layout = new HashMap<>();
+        Set<Integer> placed = new HashSet<>();
+        Set<Integer> remaining = new HashSet<>();
+        
+        for (PuzzlePiece p : pieces) {
+            remaining.add(p.id);
+        }
+        
+        if (matches.isEmpty()) {
+            // Fallback: place first piece at origin
+            layout.put(0, new GridPos(0, 0));
+            placed.add(0);
+            remaining.remove(0);
+        } else {
+            // Start with the best matching pair (highest score = smallest error)
+            EdgeMatch bestPair = matches.get(0);
+            layout.put(bestPair.piece1, new GridPos(0, 0));
+            placed.add(bestPair.piece1);
+            remaining.remove(bestPair.piece1);
+            
+            // Place second piece based on edge direction
+            // If piece1's edge matches piece2's opposite edge,
+            // piece2 is positioned relative to piece1 based on piece1's edge direction
+            int piece2 = bestPair.piece2;
+            GridPos piece1Pos = layout.get(bestPair.piece1);
+            GridPos piece2Pos;
+            
+            // Calculate rotation needed for piece2 based on edge match
+            int rotationNeeded = calculateRotation(bestPair.edge2, getOppositeEdge(bestPair.edge1));
+            pieces.get(piece2).additionalRotation = rotationNeeded;
+            
+            switch (bestPair.edge1) {
+                case RIGHT:
+                    // piece1's right edge matches piece2's left edge
+                    // piece2 is to the RIGHT of piece1
+                    piece2Pos = new GridPos(piece1Pos.row, piece1Pos.col + 1);  // same row, col+1
+                    break;
+                case LEFT:
+                    // piece1's left edge matches piece2's right edge
+                    // piece2 is to the LEFT of piece1
+                    piece2Pos = new GridPos(piece1Pos.row, piece1Pos.col - 1);  // same row, col-1
+                    break;
+                case BOTTOM:
+                    // piece1's bottom edge matches piece2's top edge
+                    // piece2 is BELOW piece1
+                    piece2Pos = new GridPos(piece1Pos.row + 1, piece1Pos.col);  // row+1, same col
+                    break;
+                case TOP:
+                    // piece1's top edge matches piece2's bottom edge
+                    // piece2 is ABOVE piece1
+                    piece2Pos = new GridPos(piece1Pos.row - 1, piece1Pos.col);  // row-1, same col
+                    break;
+                default:
+                    piece2Pos = new GridPos(piece1Pos.row, piece1Pos.col + 1);
+            }
+            layout.put(piece2, piece2Pos);
+            placed.add(piece2);
+            remaining.remove(piece2);
+            
+            System.out.println("Starting with best pair: Piece " + bestPair.piece1 + 
+                             " at (" + piece1Pos.row + "," + piece1Pos.col + ") and Piece " + piece2 +
+                             " at (" + piece2Pos.row + "," + piece2Pos.col + ")" +
+                             " [" + bestPair.edge1 + " matches " + bestPair.edge2 + ", rotation=" + rotationNeeded + "°]");
+        }
+        
+        // Greedy placement: for each remaining piece, find best position
+        while (!remaining.isEmpty()) {
+            int bestTile = -1;
+            GridPos bestPos = null;
+            double bestScore = Double.NEGATIVE_INFINITY;
+            
+            for (int candidateId : remaining) {
+                // Try to match with each placed piece
+                for (int placedId : placed) {
+                    // Check all 4 edges of the placed piece
+                    for (EdgeType edge : EdgeType.values()) {
+                        // Find the matching edge in candidate
+                        EdgeType oppositeEdge = getOppositeEdge(edge);
+                        
+                        // Search for a match between these edges
+                        for (EdgeMatch m : matches) {
+                            if (m.piece1 == placedId && m.edge1 == edge && 
+                                m.piece2 == candidateId && m.edge2 == oppositeEdge) {
+                                
+                                GridPos placedPos = layout.get(placedId);
+                                GridPos candidatePos;
+                                
+                                // Calculate candidate position based on edge
+                                switch (edge) {
+                                    case TOP:
+                                        candidatePos = new GridPos(placedPos.row - 1, placedPos.col);
+                                        break;
+                                    case BOTTOM:
+                                        candidatePos = new GridPos(placedPos.row + 1, placedPos.col);
+                                        break;
+                                    case LEFT:
+                                        candidatePos = new GridPos(placedPos.row, placedPos.col - 1);
+                                        break;
+                                    case RIGHT:
+                                        candidatePos = new GridPos(placedPos.row, placedPos.col + 1);
+                                        break;
+                                    default:
+                                        candidatePos = placedPos;
+                                }
+                                
+                                // Check if position is free
+                                boolean positionFree = true;
+                                for (GridPos pos : layout.values()) {
+                                    if (pos.equals(candidatePos)) {
+                                        positionFree = false;
+                                        break;
+                                    }
+                                }
+                                
+                                // Higher score = better match (lower error)
+                                if (positionFree && m.score > bestScore) {
+                                    bestScore = m.score;
+                                    bestTile = candidateId;
+                                    bestPos = candidatePos;
+                                    // Calculate rotation needed for this piece
+                                    int rotationNeeded = calculateRotation(m.edge2, oppositeEdge);
+                                    pieces.get(candidateId).additionalRotation = rotationNeeded;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If no good match found, use fallback strategy from Python
+            if (bestTile == -1) {
+                // Pick any remaining tile
+                bestTile = remaining.iterator().next();
+                System.out.println("  [FALLBACK] No match found for piece " + bestTile + ", using fallback placement");
+                
+                // Find first free adjacent position to any already placed piece
+                GridPos newPos = null;
+                outerLoop:
+                for (GridPos pos : layout.values()) {
+                    // Try all 4 adjacent positions
+                    GridPos[] candidates = {
+                        new GridPos(pos.row, pos.col + 1),   // right (prefer horizontal)
+                        new GridPos(pos.row + 1, pos.col),   // below
+                        new GridPos(pos.row, pos.col - 1),   // left
+                        new GridPos(pos.row - 1, pos.col)    // above
+                    };
+                    for (GridPos cand : candidates) {
+                        boolean isFree = true;
+                        for (GridPos existing : layout.values()) {
+                            if (existing.equals(cand)) {
+                                isFree = false;
+                                break;
+                            }
+                        }
+                        if (isFree) {
+                            newPos = cand;
+                            break outerLoop;
+                        }
+                    }
+                }
+                // If still no position found, expand grid
+                if (newPos == null) {
+                    // Find max row and col
+                    int maxRow = Integer.MIN_VALUE;
+                    int maxCol = Integer.MIN_VALUE;
+                    for (GridPos pos : layout.values()) {
+                        maxRow = Math.max(maxRow, pos.row);
+                        maxCol = Math.max(maxCol, pos.col);
+                    }
+                    newPos = new GridPos(0, maxCol + 1);
+                }
+                bestPos = newPos;
+            } else {
+                System.out.println("  Piece " + bestTile + " -> GridPos(row=" + bestPos.row + ", col=" + bestPos.col + ")" +
+                                 " with score " + bestScore + " [rotation=" + pieces.get(bestTile).additionalRotation + "°]");
+            }
+            
+            layout.put(bestTile, bestPos);
+            placed.add(bestTile);
+            remaining.remove(bestTile);
+        }
+        
+        System.out.println("Placed " + placed.size() + " out of " + pieces.size() + " pieces");
+        System.out.println("\nLayout computed:");
+        for (int i = 0; i < pieces.size(); i++) {
+            if (layout.containsKey(i)) {
+                GridPos pos = layout.get(i);
+                System.out.println("  Piece " + i + " -> GridPos(row=" + pos.row + ", col=" + pos.col + ")");
+            }
+        }
+        return layout;
+    }
+    
+    /**
+     * Calculate how many degrees clockwise rotation is needed to align currentEdge to targetEdge.
+     * For example, if piece's LEFT edge needs to become TOP, rotate 90° clockwise.
+     */
+    private int calculateRotation(EdgeType currentEdge, EdgeType targetEdge) {
+        if (currentEdge == targetEdge) return 0;
+        
+        // Map edges to rotation values (0=TOP, 90=RIGHT, 180=BOTTOM, 270=LEFT)
+        int current = edgeToRotation(currentEdge);
+        int target = edgeToRotation(targetEdge);
+        
+        int rotation = (target - current + 360) % 360;
+        return rotation;
+    }
+    
+    private int edgeToRotation(EdgeType edge) {
+        switch (edge) {
+            case TOP: return 0;
+            case RIGHT: return 90;
+            case BOTTOM: return 180;
+            case LEFT: return 270;
+            default: return 0;
+        }
+    }
+    
+    /**
+     * Get the opposite edge direction.
+     */
+    private EdgeType getOppositeEdge(EdgeType edge) {
+        switch (edge) {
+            case TOP: return EdgeType.BOTTOM;
+            case BOTTOM: return EdgeType.TOP;
+            case LEFT: return EdgeType.RIGHT;
+            case RIGHT: return EdgeType.LEFT;
+            default: return edge;
+        }
+    }
+
+    /**
+     * Place remaining pieces that weren't placed in the initial algorithm.
+     */
+    public void placeRemainingPieces(Map<Integer, GridPos> layout,
+                                    List<EdgeMatch> matches) {
+        
+        List<Integer> remaining = new ArrayList<>();
+        for (PuzzlePiece p : pieces) {
+            if (!layout.containsKey(p.id)) {
+                remaining.add(p.id);
+            }
+        }
+        
+        if (remaining.isEmpty()) {
+            System.out.println("All pieces placed!");
+            return;
+        }
+        
+        System.out.println("Placing " + remaining.size() + " remaining pieces...");
+        
+        // Try to place unplaced pieces by finding any adjacent placement
+        for (int pieceId : remaining) {
+            int bestPlacedId = -1;
+            GridPos bestPos = null;
+            double bestScore = Double.NEGATIVE_INFINITY;
+            
+            // Try each already-placed piece as an anchor
+            for (Integer placedId : layout.keySet()) {
+                GridPos placedPos = layout.get(placedId);
+                
+                // Try all 4 directions around the placed piece
+                GridPos[] neighborPositions = {
+                    new GridPos(placedPos.row - 1, placedPos.col),  // TOP
+                    new GridPos(placedPos.row + 1, placedPos.col),  // BOTTOM
+                    new GridPos(placedPos.row, placedPos.col - 1),  // LEFT
+                    new GridPos(placedPos.row, placedPos.col + 1)   // RIGHT
+                };
+                
+                for (GridPos testPos : neighborPositions) {
+                    // Check if position is free
+                    boolean positionFree = true;
+                    for (GridPos pos : layout.values()) {
+                        if (pos.equals(testPos)) {
+                            positionFree = false;
+                            break;
+                        }
+                    }
+                    
+                    if (!positionFree) continue;
+                    
+                    // Find if there's a good match between these pieces
+                    double matchScore = -1000;  // Default bad score
+                    for (EdgeMatch m : matches) {
+                        if (m.piece1 == placedId && m.piece2 == pieceId) {
+                            matchScore = Math.max(matchScore, m.score);
+                        }
+                    }
+                    
+                    if (matchScore > bestScore) {
+                        bestScore = matchScore;
+                        bestPlacedId = placedId;
+                        bestPos = testPos;
+                    }
+                }
+            }
+            
+            if (bestPos != null) {
+                layout.put(pieceId, bestPos);
+            } else {
+                // Fallback: place at an empty adjacent spot
+                GridPos anyPlaced = layout.values().iterator().next();
+                layout.put(pieceId, new GridPos(anyPlaced.row + 1, anyPlaced.col));
+            }
+        }
+    }
+
+    /**
+     * Normalize layout positions and compute final positions for animation.
+     * Matches Python's approach: handle variable tile sizes properly.
+     */
+    private void normalizeMLayoutAndComputeFinalPositions(Map<Integer, GridPos> layout) {
+        if (layout.isEmpty()) return;
+        
+        // Normalize to start at (0,0)
+        int minRow = Integer.MAX_VALUE, minCol = Integer.MAX_VALUE;
+        int maxRow = Integer.MIN_VALUE, maxCol = Integer.MIN_VALUE;
+        
+        for (GridPos pos : layout.values()) {
+            minRow = Math.min(minRow, pos.row);
+            minCol = Math.min(minCol, pos.col);
+            maxRow = Math.max(maxRow, pos.row);
+            maxCol = Math.max(maxCol, pos.col);
+        }
+        
+        System.out.println("Grid dimensions: rows [" + minRow + " to " + maxRow + "], cols [" + minCol + " to " + maxCol + "]");
+        
+        // Compute column widths and row heights (like Python's col_widths/row_heights)
+        Map<Integer, Integer> colWidths = new HashMap<>();
+        Map<Integer, Integer> rowHeights = new HashMap<>();
+        
+        for (PuzzlePiece p : pieces) {
+            GridPos pos = layout.get(p.id);
+            if (pos != null) {
+                int normalizedCol = pos.col - minCol;
+                int normalizedRow = pos.row - minRow;
+                
+                colWidths.put(normalizedCol, 
+                    Math.max(colWidths.getOrDefault(normalizedCol, 0), p.image.getWidth()));
+                rowHeights.put(normalizedRow,
+                    Math.max(rowHeights.getOrDefault(normalizedRow, 0), p.image.getHeight()));
+                
+                p.gridRow = normalizedRow;
+                p.gridCol = normalizedCol;
+            }
+        }
+        
+        // Compute pixel positions for each grid cell (top-left corner)
+        Map<Integer, Integer> colX = new HashMap<>();
+        Map<Integer, Integer> rowY = new HashMap<>();
+        
+        int margin = 20;
+        int curX = margin;
+        for (int c = 0; c <= maxCol - minCol; c++) {
+            colX.put(c, curX);
+            int width = colWidths.getOrDefault(c, 100);
+            curX += width;
+            System.out.println("  Col " + c + ": x=" + colX.get(c) + ", width=" + width);
+        }
+        
+        int curY = margin;
+        for (int r = 0; r <= maxRow - minRow; r++) {
+            rowY.put(r, curY);
+            int height = rowHeights.getOrDefault(r, 100);
+            curY += height;
+            System.out.println("  Row " + r + ": y=" + rowY.get(r) + ", height=" + height);
+        }
+        
+        // Set final positions (centered in their cells, like Python)
+        for (PuzzlePiece p : pieces) {
+            if (p.gridRow >= 0 && p.gridCol >= 0) {
+                int cellW = colWidths.getOrDefault(p.gridCol, p.image.getWidth());
+                int cellH = rowHeights.getOrDefault(p.gridRow, p.image.getHeight());
+                
+                // Center the piece in its cell
+                double cx = colX.get(p.gridCol) + cellW / 2.0;
+                double cy = rowY.get(p.gridRow) + cellH / 2.0;
+                
+                p.finalPosition = new Point((int) cx, (int) cy);
+                p.finalRotation = -p.initialRotation;  // Rotate back to upright orientation
+                
+                System.out.println("  Piece " + p.id + " final pos: (" + (int)cx + ", " + (int)cy + ")" +
+                                 " from initial: (" + p.initialPosition.x + ", " + p.initialPosition.y + ")" +
+                                 " rotation: " + p.initialRotation + " -> " + p.finalRotation +
+                                 " (additional: " + p.additionalRotation + "°)");
+            }
+        }
+    }
+
+    // ~~~~~~~~~~~~~~~
+    // Animation
+    
+    public void showAnimatedSolution(Map<Integer, GridPos> layout) {
+        normalizeMLayoutAndComputeFinalPositions(layout);
+        
+        int frameCount = 50;
+        int canvasW = width;
+        int canvasH = height;
+        
+        System.out.println("Starting animation with " + frameCount + " frames...");
+        
+        for (int f = 0; f < frameCount; f++) {
+            // Match Python: alpha goes from 0 to 1 over frameCount frames
+            double alpha = f / (double) (frameCount - 1);
+            
+            BufferedImage canvas = new BufferedImage(canvasW, canvasH, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = canvas.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setColor(Color.BLACK);
+            g.fillRect(0, 0, canvasW, canvasH);
+            
+            for (PuzzlePiece p : pieces) {
+                // Interpolate position and rotation (linear interpolation)
+                double x = p.initialPosition.x * (1 - alpha) + p.finalPosition.x * alpha;
+                double y = p.initialPosition.y * (1 - alpha) + p.finalPosition.y * alpha;
+                double angle = p.initialRotation * (1 - alpha) + p.finalRotation * alpha;
+                
+                // Draw piece at interpolated position/rotation
+                BufferedImage img = p.image;
+                
+                // Apply transformation: translate to position, rotate around center
+                AffineTransform transform = new AffineTransform();
+                transform.translate(x, y);  // Move to current position
+                transform.rotate(Math.toRadians(angle));  // Rotate around center
+                transform.translate(-img.getWidth() / 2.0, -img.getHeight() / 2.0);  // Center the image
+                
+                g.drawImage(img, transform, null);
+            }
+            
+            g.dispose();
+            
+            // Display frame
+            lbIm1.setIcon(new ImageIcon(canvas));
+            if (frame != null) {
+                frame.repaint();
+            }
+            
+            try {
+                Thread.sleep(30);  // ~33 fps
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        
+        System.out.println("Animation complete!");
+    }
+
+    public void showInputImage() {
+        JFrame inputFrame = new JFrame("Input Image");
+        inputFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        inputFrame.add(new JLabel(new ImageIcon(imgOne)));
+        inputFrame.pack();
+        inputFrame.setVisible(true);
+    }
+
+    public void showReconstructedPuzzle(Map<Integer, GridPos> layout) {
+        normalizeMLayoutAndComputeFinalPositions(layout);
+        
+        // Calculate canvas size
+        int maxRow = 0, maxCol = 0;
+        for (PuzzlePiece p : pieces) {
+            maxRow = Math.max(maxRow, p.gridRow);
+            maxCol = Math.max(maxCol, p.gridCol);
+        }
+        
+        int canvasW = (maxCol + 1) * 100;
+        int canvasH = (maxRow + 1) * 100;
+        BufferedImage canvas = new BufferedImage(canvasW, canvasH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = canvas.createGraphics();
+        g.setColor(Color.BLACK);
+        g.fillRect(0, 0, canvasW, canvasH);
+        
+        for (PuzzlePiece p : pieces) {
+            BufferedImage img = p.image;
+            
+            // Apply additional rotation if needed
+            if (p.additionalRotation != 0) {
+                AffineTransform transform = new AffineTransform();
+                transform.translate(p.finalPosition.x, p.finalPosition.y);
+                transform.rotate(Math.toRadians(p.additionalRotation));
+                transform.translate(-img.getWidth() / 2.0, -img.getHeight() / 2.0);
+                g.drawImage(img, transform, null);
+            } else {
+                int drawX = (int) p.finalPosition.x - img.getWidth() / 2;
+                int drawY = (int) p.finalPosition.y - img.getHeight() / 2;
+                g.drawImage(img, drawX, drawY, null);
+            }
+        }
+        
+        g.dispose();
+        
+        JFrame resultFrame = new JFrame("Reconstructed Puzzle");
+        resultFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        resultFrame.add(new JLabel(new ImageIcon(canvas)));
+        resultFrame.pack();
+        resultFrame.setVisible(true);
+    }
+
+    // ~~~~~~~~~~~~~~~
     // Visual debug
+    
     public void showPiecesRotatedOnCanvas() {
         BufferedImage display = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
         Graphics2D g = display.createGraphics();
@@ -561,1052 +1227,6 @@ public class ImageDisplay {
         pieceFrame.setVisible(true);
     }
 
-    // ~~~~~~~~~~~~~~~
-    // Edge matching: RGB + gradient histograms from CLEAN inner strips
-
-    enum EdgeType {
-        TOP, BOTTOM, LEFT, RIGHT
-    }
-
-    static class EdgeMatch implements Comparable<EdgeMatch> {
-        int piece1Id;
-        EdgeType edge1;
-        int piece2Id;
-        EdgeType edge2;
-        double score;   // lower = better
-
-        EdgeMatch(int p1, EdgeType e1, int p2, EdgeType e2, double score) {
-            this.piece1Id = p1;
-            this.edge1 = e1;
-            this.piece2Id = p2;
-            this.edge2 = e2;
-            this.score = score;
-        }
-
-        @Override
-        public int compareTo(EdgeMatch other) {
-            return Double.compare(this.score, other.score);
-        }
-
-        @Override
-        public String toString() {
-            return String.format("Piece %d (%s) <-> Piece %d (%s): %.4f",
-                    piece1Id, edge1, piece2Id, edge2, score);
-        }
-    }
-
-    // Histogram configuration: 32 bins per channel => 96 total
-    private static final int HIST_BINS = 32;
-
-    // For inner-strip sampling
-    private static final int EDGE_STRIP_WIDTH = 4;      // pixels inward from border
-    private static final int BG_BRIGHTNESS_THRESH = 10; // "near black" threshold
-
-    private boolean isBackgroundColor(int rgb) {
-        int r = (rgb >> 16) & 0xFF;
-        int g = (rgb >> 8) & 0xFF;
-        int b = rgb & 0xFF;
-        int bright = (r + g + b) / 3;
-        return bright < BG_BRIGHTNESS_THRESH;
-    }
-
-    /**
-     * Sample a clean edge strip:
-     *  - For each position along the edge, look inward up to EDGE_STRIP_WIDTH pixels
-     *  - Ignore near-black pixels, average the rest
-     *  - If everything is background, fall back to the border pixel
-     */
-    private int[] sampleCleanEdge(BufferedImage img, EdgeType edge) {
-        int w = img.getWidth();
-        int h = img.getHeight();
-
-        if (w <= 0 || h <= 0) {
-            return new int[0];
-        }
-
-        int len = (edge == EdgeType.TOP || edge == EdgeType.BOTTOM) ? w : h;
-        int[] strip = new int[len];
-
-        for (int i = 0; i < len; i++) {
-            int sumR = 0, sumG = 0, sumB = 0, count = 0;
-
-            if (edge == EdgeType.TOP) {
-                int x = i;
-                for (int dy = 0; dy < EDGE_STRIP_WIDTH && dy < h; dy++) {
-                    int y = dy;
-                    int rgb = img.getRGB(x, y);
-                    if (!isBackgroundColor(rgb)) {
-                        sumR += (rgb >> 16) & 0xFF;
-                        sumG += (rgb >> 8) & 0xFF;
-                        sumB += rgb & 0xFF;
-                        count++;
-                    }
-                }
-                if (count == 0) {
-                    strip[i] = img.getRGB(x, 0);
-                } else {
-                    strip[i] = ((sumR / count) << 16) | ((sumG / count) << 8) | (sumB / count);
-                }
-            } else if (edge == EdgeType.BOTTOM) {
-                int x = i;
-                for (int dy = 0; dy < EDGE_STRIP_WIDTH && dy < h; dy++) {
-                    int y = h - 1 - dy;
-                    int rgb = img.getRGB(x, y);
-                    if (!isBackgroundColor(rgb)) {
-                        sumR += (rgb >> 16) & 0xFF;
-                        sumG += (rgb >> 8) & 0xFF;
-                        sumB += rgb & 0xFF;
-                        count++;
-                    }
-                }
-                if (count == 0) {
-                    strip[i] = img.getRGB(x, h - 1);
-                } else {
-                    strip[i] = ((sumR / count) << 16) | ((sumG / count) << 8) | (sumB / count);
-                }
-            } else if (edge == EdgeType.LEFT) {
-                int y = i;
-                for (int dx = 0; dx < EDGE_STRIP_WIDTH && dx < w; dx++) {
-                    int x = dx;
-                    int rgb = img.getRGB(x, y);
-                    if (!isBackgroundColor(rgb)) {
-                        sumR += (rgb >> 16) & 0xFF;
-                        sumG += (rgb >> 8) & 0xFF;
-                        sumB += rgb & 0xFF;
-                        count++;
-                    }
-                }
-                if (count == 0) {
-                    strip[i] = img.getRGB(0, y);
-                } else {
-                    strip[i] = ((sumR / count) << 16) | ((sumG / count) << 8) | (sumB / count);
-                }
-            } else { // RIGHT
-                int y = i;
-                for (int dx = 0; dx < EDGE_STRIP_WIDTH && dx < w; dx++) {
-                    int x = w - 1 - dx;
-                    int rgb = img.getRGB(x, y);
-                    if (!isBackgroundColor(rgb)) {
-                        sumR += (rgb >> 16) & 0xFF;
-                        sumG += (rgb >> 8) & 0xFF;
-                        sumB += rgb & 0xFF;
-                        count++;
-                    }
-                }
-                if (count == 0) {
-                    strip[i] = img.getRGB(w - 1, y);
-                } else {
-                    strip[i] = ((sumR / count) << 16) | ((sumG / count) << 8) | (sumB / count);
-                }
-            }
-        }
-
-        return strip;
-    }
-
-    // Compute RGB histogram of a CLEAN edge strip.
-    private float[] computeEdgeHistogram(BufferedImage img, EdgeType edge) {
-        float[] hist = new float[HIST_BINS * 3];
-        Arrays.fill(hist, 0f);
-
-        int[] strip = sampleCleanEdge(img, edge);
-        if (strip.length == 0) return hist;
-
-        for (int rgb : strip) {
-            accumulateColorToHist(rgb, hist);
-        }
-
-        // normalize
-        for (int i = 0; i < hist.length; i++) {
-            hist[i] /= (float) strip.length;
-        }
-
-        return hist;
-    }
-
-    private void accumulateColorToHist(int rgb, float[] hist) {
-        int r = (rgb >> 16) & 0xFF;
-        int g = (rgb >> 8) & 0xFF;
-        int b = rgb & 0xFF;
-
-        int rBin = (r * HIST_BINS) / 256;
-        int gBin = (g * HIST_BINS) / 256;
-        int bBin = (b * HIST_BINS) / 256;
-
-        if (rBin >= HIST_BINS) rBin = HIST_BINS - 1;
-        if (gBin >= HIST_BINS) gBin = HIST_BINS - 1;
-        if (bBin >= HIST_BINS) bBin = HIST_BINS - 1;
-
-        hist[rBin] += 1f;
-        hist[HIST_BINS + gBin] += 1f;
-        hist[HIST_BINS * 2 + bBin] += 1f;
-    }
-
-    /**
-     * L1 distance between two normalized histograms.
-     * Lower distance = better match.
-     */
-    private double histogramDistance(float[] h1, float[] h2) {
-        double d = 0.0;
-        for (int i = 0; i < h1.length; i++) {
-            d += Math.abs(h1[i] - h2[i]);
-        }
-        return d;
-    }
-
-    private EdgeType getComplementaryEdge(EdgeType e) {
-        switch (e) {
-            case TOP: return EdgeType.BOTTOM;
-            case BOTTOM: return EdgeType.TOP;
-            case LEFT: return EdgeType.RIGHT;
-            case RIGHT: return EdgeType.LEFT;
-            default: return null;
-        }
-    }
-
-    //~~~~~~~~~~~~~~~
-    // GRADIENT HISTOGRAMS (32 bins for gradient magnitude)
-
-    private static final int GRAD_BINS = 32;
-
-    private float[] computeGradientHistogram(BufferedImage img, EdgeType edge) {
-        float[] hist = new float[GRAD_BINS];
-        Arrays.fill(hist, 0f);
-
-        int[] strip = sampleCleanEdge(img, edge);
-        if (strip.length < 2) return hist;
-
-        // 1D gradient along edge
-        for (int i = 1; i < strip.length - 1; i++) {
-            int c1 = strip[i - 1];
-            int c2 = strip[i + 1];
-
-            int gray1 = ((c1 >> 16) & 255) + ((c1 >> 8) & 255) + (c1 & 255);
-            int gray2 = ((c2 >> 16) & 255) + ((c2 >> 8) & 255) + (c2 & 255);
-
-            int diff = Math.abs(gray2 - gray1);  // approximate gradient magnitude
-            int bin = (diff * GRAD_BINS) / 765;  // 255*3
-
-            if (bin >= GRAD_BINS) bin = GRAD_BINS - 1;
-            hist[bin]++;
-        }
-
-        // normalize
-        float total = 0;
-        for (float f : hist) total += f;
-        if (total > 0) {
-            for (int i = 0; i < GRAD_BINS; i++) hist[i] /= total;
-        }
-
-        return hist;
-    }
-
-    private double gradientDistance(float[] g1, float[] g2) {
-        double d = 0;
-        for (int i = 0; i < GRAD_BINS; i++) {
-            d += Math.abs(g1[i] - g2[i]);
-        }
-        return d;
-    }
-
-    /**
-     * Direct per-pixel RGB difference along two clean edges.
-     * Lower = better match. This is the strongest cue for perfect alignment.
-     */
-    private double computeEdgePixelDifference(BufferedImage img1, EdgeType e1,
-                                            BufferedImage img2, EdgeType e2) {
-
-        int[] strip1 = sampleCleanEdge(img1, e1);
-        int[] strip2 = sampleCleanEdge(img2, e2);
-
-        int len = Math.min(strip1.length, strip2.length);
-        if (len == 0) return Double.MAX_VALUE;
-
-        double sum = 0;
-        int count = 0;
-
-        for (int i = 0; i < len; i++) {
-            int c1 = strip1[i];
-            int c2 = strip2[i];
-
-            // skip background-ish
-            if (isBackgroundColor(c1) || isBackgroundColor(c2)) continue;
-
-            int r1 = (c1 >> 16) & 255;
-            int g1 = (c1 >> 8) & 255;
-            int b1 = (c1) & 255;
-
-            int r2 = (c2 >> 16) & 255;
-            int g2 = (c2 >> 8) & 255;
-            int b2 = (c2) & 255;
-
-            int dr = r1 - r2;
-            int dg = g1 - g2;
-            int db = b1 - b2;
-
-            sum += Math.sqrt(dr*dr + dg*dg + db*db);
-            count++;
-        }
-
-        if (count == 0) return Double.MAX_VALUE;
-
-        return sum / count;
-    }
-
-    // Compute variance of an edge to detect "boring" edges
-    private double computeEdgeVariance(BufferedImage img, EdgeType edge) {
-        int[] strip = sampleCleanEdge(img, edge);
-        if (strip.length == 0) return 0;
-        
-        // Calculate variance of grayscale values
-        double[] grays = new double[strip.length];
-        double mean = 0;
-        
-        for (int i = 0; i < strip.length; i++) {
-            int rgb = strip[i];
-            int gray = ((rgb >> 16) & 255) + ((rgb >> 8) & 255) + (rgb & 255);
-            grays[i] = gray / 3.0;
-            mean += grays[i];
-        }
-        mean /= strip.length;
-        
-        double variance = 0;
-        for (double g : grays) {
-            variance += (g - mean) * (g - mean);
-        }
-        variance /= strip.length;
-        
-        return variance;
-    }
-
-    // Check if an edge is "interesting" enough for reliable matching
-    private boolean isInterestingEdge(BufferedImage img, EdgeType edge) {
-        double variance = computeEdgeVariance(img, edge);
-        // Threshold: edges with variance < 100 are too uniform
-        return variance > 100.0;  // Adjust this threshold as needed
-    }
-
-    /**
-     * Analyze piece sizes to understand variation from edge healing
-     */
-    private void analyzePieceSizes() {
-        System.out.println("\n=== Piece Size Analysis ===");
-        
-        int minW = Integer.MAX_VALUE, maxW = 0;
-        int minH = Integer.MAX_VALUE, maxH = 0;
-        int totalW = 0, totalH = 0;
-        
-        for (PuzzlePiece p : pieces) {
-            int w = p.image.getWidth();
-            int h = p.image.getHeight();
-            
-            minW = Math.min(minW, w);
-            maxW = Math.max(maxW, w);
-            minH = Math.min(minH, h);
-            maxH = Math.max(maxH, h);
-            totalW += w;
-            totalH += h;
-            
-            // Show pieces with extreme rotations
-            if (Math.abs(p.rotationAngle) > 60) {
-                System.out.println("  Piece " + p.id + ": " + w + "x" + h + 
-                                " (rotated " + p.rotationAngle + "°)");
-            }
-        }
-        
-        int avgW = totalW / pieces.size();
-        int avgH = totalH / pieces.size();
-        
-        System.out.println("Width:  min=" + minW + ", max=" + maxW + 
-                        ", avg=" + avgW + ", range=" + (maxW - minW));
-        System.out.println("Height: min=" + minH + ", max=" + maxH + 
-                        ", avg=" + avgH + ", range=" + (maxH - minH));
-        
-        // Warn if variation is large
-        if (maxW - minW > 20 || maxH - minH > 20) {
-            System.out.println("WARNING: Large size variation (likely from rotation + edge healing)");
-            System.out.println("         Using lenient spatial compatibility checks");
-        }
-    }
-
-    /**
-     * Resample a color strip to a different length using nearest neighbor
-     */
-    private int[] resampleStrip(int[] strip, int newLen) {
-        int[] resampled = new int[newLen];
-        double scale = (double) strip.length / newLen;
-        
-        for (int i = 0; i < newLen; i++) {
-            int srcIndex = (int) (i * scale);
-            if (srcIndex >= strip.length) srcIndex = strip.length - 1;
-            resampled[i] = strip[srcIndex];
-        }
-        
-        return resampled;
-    }
-
-    /**
-     * Compute edge pixel difference with size mismatch handling
-     */
-    private double computeEdgePixelDifferenceWithResize(BufferedImage img1, EdgeType e1,
-                                                        BufferedImage img2, EdgeType e2) {
-        int[] strip1 = sampleCleanEdge(img1, e1);
-        int[] strip2 = sampleCleanEdge(img2, e2);
-        
-        if (strip1.length == 0 || strip2.length == 0) return Double.MAX_VALUE;
-        
-        // Handle size mismatch by interpolating the shorter strip
-        int targetLen = Math.min(strip1.length, strip2.length);
-        
-        if (strip1.length != strip2.length) {
-            if (strip1.length > targetLen) {
-                strip1 = resampleStrip(strip1, targetLen);
-            } else {
-                strip2 = resampleStrip(strip2, targetLen);
-            }
-        }
-        
-        double sum = 0;
-        int count = 0;
-        
-        for (int i = 0; i < targetLen; i++) {
-            int c1 = strip1[i];
-            int c2 = strip2[i];
-            
-            if (isBackgroundColor(c1) || isBackgroundColor(c2)) continue;
-            
-            int r1 = (c1 >> 16) & 255;
-            int g1 = (c1 >> 8) & 255;
-            int b1 = c1 & 255;
-            
-            int r2 = (c2 >> 16) & 255;
-            int g2 = (c2 >> 8) & 255;
-            int b2 = c2 & 255;
-            
-            int dr = r1 - r2;
-            int dg = g1 - g2;
-            int db = b1 - b2;
-            
-            sum += Math.sqrt(dr*dr + dg*dg + db*db);
-            count++;
-        }
-        
-        return (count == 0) ? Double.MAX_VALUE : sum / count;
-    }
-
-    //Enhanced spatial compatibility that considers rotation and actual positions.
-    /**
-     * Enhanced spatial compatibility that accounts for edge healing size variations
-     */
-    private boolean areSpatiallyCompatibleEnhanced(PuzzlePiece p1, EdgeType e1, 
-                                                    PuzzlePiece p2, EdgeType e2) {
-        int w1 = p1.image.getWidth();
-        int h1 = p1.image.getHeight();
-        int w2 = p2.image.getWidth();
-        int h2 = p2.image.getHeight();
-        
-        int edgeLen1 = (e1 == EdgeType.TOP || e1 == EdgeType.BOTTOM) ? w1 : h1;
-        int edgeLen2 = (e2 == EdgeType.TOP || e2 == EdgeType.BOTTOM) ? w2 : h2;
-        
-        int minLen = Math.min(edgeLen1, edgeLen2);
-        int maxLen = Math.max(edgeLen1, edgeLen2);
-        int diff = maxLen - minLen;
-        
-        // IMPORTANT: After rotation + edge healing, pieces can differ by 10-20 pixels
-        // Allow up to 25 pixels difference OR 25% size variation (whichever is more permissive)
-        boolean edgesCompatible = (diff <= 25) || (maxLen <= minLen * 1.25);
-        
-        if (!edgesCompatible) {
-            return false;
-        }
-        
-        // Check that pieces aren't absurdly different in total area
-        int area1 = w1 * h1;
-        int area2 = w2 * h2;
-        
-        if (area1 == 0 || area2 == 0) return false;
-        
-        double areaRatio = (double) Math.max(area1, area2) / Math.min(area1, area2);
-        
-        // Allow up to 2.5x area difference (one piece heavily cropped, other minimally)
-        return areaRatio <= 2.5;
-    }
-
-    //~~~~~~~~~~~~~~~
-    // Combined RGB + Gradient Histogram Edge Matching (using clean edges)
-    public List<EdgeMatch> performEdgeMatching() {
-        List<EdgeMatch> matches = new ArrayList<>();
-        System.out.println("Starting edge matching with variance filtering..");
-        
-        // NEW: Analyze piece sizes first
-        analyzePieceSizes();
-
-        int skippedVariance = 0;
-        int skippedSpatial = 0;
-        int totalConsidered = 0;
-
-        for (int i = 0; i < pieces.size(); i++) {
-            for (int j = i + 1; j < pieces.size(); j++) {
-
-                PuzzlePiece p1 = pieces.get(i);
-                PuzzlePiece p2 = pieces.get(j);
-
-                for (EdgeType e1 : EdgeType.values()) {
-                    EdgeType e2 = getComplementaryEdge(e1);
-                    totalConsidered++;
-
-                    // Spatial compatibility check (now more lenient for rotated pieces)
-                    if (!areSpatiallyCompatibleEnhanced(p1, e1, p2, e2)) {
-                        skippedSpatial++;
-                        continue;
-                    }
-
-                    // Variance check
-                    double var1 = computeEdgeVariance(p1.image, e1);
-                    double var2 = computeEdgeVariance(p2.image, e2);
-                    
-                    // Skip if BOTH edges are too uniform (boring edges)
-                    if (var1 < 100 && var2 < 100) {
-                        skippedVariance++;
-                        continue;
-                    }
-
-                    float[] rgb1 = computeEdgeHistogram(p1.image, e1);
-                    float[] rgb2 = computeEdgeHistogram(p2.image, e2);
-                    double rgbDist = histogramDistance(rgb1, rgb2);
-
-                    float[] g1 = computeGradientHistogram(p1.image, e1);
-                    float[] g2 = computeGradientHistogram(p2.image, e2);
-                    double gradDist = gradientDistance(g1, g2);
-
-                    // NEW: Use resize-aware pixel difference for better handling of size mismatches
-                    double pixelDist = computeEdgePixelDifferenceWithResize(
-                        p1.image, e1, p2.image, e2);
-
-                    // Adaptive weighting based on edge complexity
-                    double avgVar = (var1 + var2) / 2.0;
-                    double score = pixelDist + 0.2 * rgbDist + 0.1 * gradDist;
-                    
-                    // Penalty for low-variance matches (makes them less attractive)
-                    if (avgVar < 200) {
-                        score *= (1.0 + (200 - avgVar) / 400);
-                    }
-
-                    matches.add(new EdgeMatch(p1.id, e1, p2.id, e2, score));
-                }
-            }
-        }
-
-        Collections.sort(matches);
-
-        System.out.println("Matching statistics:");
-        System.out.println("  Total edge pairs considered: " + totalConsidered);
-        System.out.println("  Skipped, spatial incompatibility: " + skippedSpatial);
-        System.out.println("  Skipped, low variance: " + skippedVariance);
-        System.out.println("  Matches generated: " + matches.size());
-
-        System.out.println("\nTop 20 matches:");
-        for (int k = 0; k < Math.min(20, matches.size()); k++) {
-            EdgeMatch m = matches.get(k);
-            double var1 = computeEdgeVariance(pieces.get(m.piece1Id).image, m.edge1);
-            double var2 = computeEdgeVariance(pieces.get(m.piece2Id).image, m.edge2);
-            System.out.println(m + " [var: " + String.format("%.1f", var1) + 
-                            ", " + String.format("%.1f", var2) + "]");
-        }
-
-        return matches;
-    }
-
-
-    // ~~~~~~~~~~~~~~~
-    // Build adjacency graph (mutual-best) and layout
-
-    static class PlacementEdge {
-        int fromPiece, toPiece;
-        EdgeType direction;
-        double score;
-
-        PlacementEdge(int from, int to, EdgeType dir, double score) {
-            this.fromPiece = from;
-            this.toPiece = to;
-            this.direction = dir;
-            this.score = score;
-        }
-    }
-
-    public Map<Integer, Map<EdgeType, PlacementEdge>> buildAdjacencyGraph(List<EdgeMatch> matches) {
-        System.out.println("\n=== Building Adjacency Graph ===");
-        
-        Map<Integer, Map<EdgeType, PlacementEdge>> graph = new HashMap<>();
-        for (PuzzlePiece p : pieces) {
-            graph.put(p.id, new EnumMap<>(EdgeType.class));
-        }
-        
-        Map<String, Boolean> usedEdges = new HashMap<>();
-        Set<String> connectedPairs = new HashSet<>();  // NEW: Track piece-pair connections
-        
-        double threshold = determineScoreThreshold(matches);
-        System.out.println("Using adaptive threshold: " + String.format("%.2f", threshold));
-        
-        int acceptedCount = 0;
-        int minConnections = pieces.size() - 1;
-        int maxConnections = pieces.size() * 2;
-        
-        for (EdgeMatch m : matches) {
-            String edge1Key = m.piece1Id + "_" + m.edge1;
-            String edge2Key = m.piece2Id + "_" + m.edge2;
-            
-            // Skip if either edge is already used
-            if (usedEdges.containsKey(edge1Key) || usedEdges.containsKey(edge2Key)) {
-                continue;
-            }
-            
-            // NEW: Check if these two pieces are already connected
-            String pairKey1 = Math.min(m.piece1Id, m.piece2Id) + "-" + 
-                            Math.max(m.piece1Id, m.piece2Id);
-            if (connectedPairs.contains(pairKey1)) {
-                continue;  // Skip - these pieces already have a connection
-            }
-            
-            boolean acceptMatch = (m.score <= threshold) || (acceptedCount < minConnections);
-            
-            if (acceptedCount >= maxConnections) {
-                break;
-            }
-            
-            if (!acceptMatch) {
-                continue;
-            }
-            
-            // Add bidirectional connection
-            graph.get(m.piece1Id).put(m.edge1,
-                new PlacementEdge(m.piece1Id, m.piece2Id, m.edge1, m.score));
-            graph.get(m.piece2Id).put(m.edge2,
-                new PlacementEdge(m.piece2Id, m.piece1Id, m.edge2, m.score));
-            
-            usedEdges.put(edge1Key, true);
-            usedEdges.put(edge2Key, true);
-            connectedPairs.add(pairKey1);  // NEW: Mark this pair as connected
-            acceptedCount++;
-            
-            if (acceptedCount <= 20) {
-                System.out.println("Accepted: " + m);
-            }
-        }
-        
-        System.out.println("Total connections accepted: " + acceptedCount);
-        System.out.println("\nPiece connectivity:");
-        for (int id = 0; id < pieces.size(); id++) {
-            Map<EdgeType, PlacementEdge> neighbors = graph.get(id);
-            System.out.print("Piece " + id + " (" + neighbors.size() + " edges): ");
-            for (EdgeType edge : neighbors.keySet()) {
-                PlacementEdge pe = neighbors.get(edge);
-                System.out.print(edge + "->" + pe.toPiece + " ");
-            }
-            System.out.println();
-        }
-        
-        return graph;
-    }
-
-    /**
-     * Adaptively determine score threshold based on the distribution of match scores
-     */
-    private double determineScoreThreshold(List<EdgeMatch> matches) {
-        if (matches.isEmpty()) return 100.0;
-        
-        // Look at top matches to find the "gap" where scores jump
-        int examineCount = Math.min(40, matches.size());
-        
-        // Find the largest gap in scores
-        double maxGap = 0;
-        int gapIndex = 15;  // Default to ~15 matches
-        
-        for (int i = 10; i < examineCount - 1; i++) {
-            double gap = matches.get(i + 1).score - matches.get(i).score;
-            if (gap > maxGap) {
-                maxGap = gap;
-                gapIndex = i;
-            }
-        }
-        
-        // If we found a significant gap (score jumps by >5), use it
-        if (maxGap > 5.0 && gapIndex < 30) {
-            double threshold = matches.get(gapIndex).score + 2.0;
-            System.out.println("Found score gap of " + String.format("%.2f", maxGap) + 
-                            " at index " + gapIndex);
-            return threshold;
-        }
-        
-        // Otherwise, use a percentile-based approach
-        // Take threshold as the score of the 20th-25th best match
-        int targetIndex = Math.min(20, matches.size() - 1);
-        double baseThreshold = matches.get(targetIndex).score;
-        
-        // Add some buffer (10%) to be slightly more permissive
-        return baseThreshold * 1.1;
-    }
-
-    static class GridPos {
-        int row, col;
-        GridPos(int r, int c) { row = r; col = c; }
-    }
-
-    public Map<Integer, GridPos> computeLayoutFromGraph(
-            Map<Integer, Map<EdgeType, PlacementEdge>> graph) {
-
-        Map<Integer, GridPos> pos = new HashMap<>();
-        Queue<Integer> q = new LinkedList<>();
-
-        if (pieces.isEmpty()) return pos;
-
-        // use piece 0 as root at (0,0)
-        pos.put(0, new GridPos(0, 0));
-        q.add(0);
-
-        while (!q.isEmpty()) {
-            int cur = q.poll();
-            GridPos curPos = pos.get(cur);
-
-            Map<EdgeType, PlacementEdge> neighbors = graph.get(cur);
-            if (neighbors == null) continue;
-
-            for (Map.Entry<EdgeType, PlacementEdge> entry : neighbors.entrySet()) {
-                EdgeType dir = entry.getKey();
-                PlacementEdge edge = entry.getValue();
-
-                int np = edge.toPiece;
-                if (pos.containsKey(np)) continue;
-
-                int nr = curPos.row;
-                int nc = curPos.col;
-
-                switch (dir) {
-                    case TOP:    nr--; break;
-                    case BOTTOM: nr++; break;
-                    case LEFT:   nc--; break;
-                    case RIGHT:  nc++; break;
-                }
-
-                pos.put(np, new GridPos(nr, nc));
-                q.add(np);
-            }
-        }
-
-        if (!pos.isEmpty()) {
-            int minR = Integer.MAX_VALUE, minC = Integer.MAX_VALUE;
-            for (GridPos gp : pos.values()) {
-                minR = Math.min(minR, gp.row);
-                minC = Math.min(minC, gp.col);
-            }
-            for (GridPos gp : pos.values()) {
-                gp.row -= minR;
-                gp.col -= minC;
-            }
-        }
-
-        return pos;
-    }
-
-    // Second pass: try to place pieces that weren't connected in the initial graph
-    public void placeRemainingPieces(Map<Integer, GridPos> layout, 
-                                    Map<Integer, Map<EdgeType, PlacementEdge>> graph) {
-        System.out.println("\n=== Placing Remaining Pieces ===");
-        
-        // Find unplaced pieces
-        List<Integer> unplaced = new ArrayList<>();
-        for (int id = 0; id < pieces.size(); id++) {
-            if (!layout.containsKey(id)) {
-                unplaced.add(id);
-            }
-        }
-        
-        if (unplaced.isEmpty()) {
-            System.out.println("All pieces already placed!");
-            return;
-        }
-        
-        System.out.println("Unplaced pieces: " + unplaced);
-        
-        // Find empty positions in the grid
-        Set<String> occupiedPositions = new HashSet<>();
-        for (GridPos gp : layout.values()) {
-            occupiedPositions.add(gp.row + "," + gp.col);
-        }
-        
-        // Try to place each unplaced piece
-        for (int pieceId : unplaced) {
-            System.out.println("\nTrying to place piece " + pieceId);
-            
-            double bestScore = Double.MAX_VALUE;
-            GridPos bestPos = null;
-            
-            // Try all empty positions adjacent to placed pieces
-            for (Map.Entry<Integer, GridPos> entry : layout.entrySet()) {
-                int placedId = entry.getKey();
-                GridPos placedPos = entry.getValue();
-                
-                // Check all 4 adjacent positions
-                int[][] deltas = {{-1,0}, {1,0}, {0,-1}, {0,1}};
-                EdgeType[] directions = {EdgeType.TOP, EdgeType.BOTTOM, EdgeType.LEFT, EdgeType.RIGHT};
-                
-                for (int i = 0; i < 4; i++) {
-                    int newRow = placedPos.row + deltas[i][0];
-                    int newCol = placedPos.col + deltas[i][1];
-                    String posKey = newRow + "," + newCol;
-                    
-                    // Skip if position is occupied
-                    if (occupiedPositions.contains(posKey)) {
-                        continue;
-                    }
-                    
-                    // Score this placement by checking how well it matches neighbors
-                    double score = scorePositionForPiece(pieceId, newRow, newCol, layout);
-                    
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestPos = new GridPos(newRow, newCol);
-                    }
-                }
-            }
-            
-            if (bestPos != null) {
-                layout.put(pieceId, bestPos);
-                occupiedPositions.add(bestPos.row + "," + bestPos.col);
-                System.out.println("Placed piece " + pieceId + " at (" + 
-                                bestPos.row + "," + bestPos.col + ") with score " + 
-                                String.format("%.2f", bestScore));
-            } else {
-                System.out.println("Could not find position for piece " + pieceId);
-            }
-        }
-    }
-
-    // Score how well a piece fits at a given position based on its neighbors
-    private double scorePositionForPiece(int pieceId, int row, int col, 
-                                        Map<Integer, GridPos> layout) {
-        PuzzlePiece piece = pieces.get(pieceId);
-        
-        double totalScore = 0;
-        int neighborCount = 0;
-        
-        // Check all 4 directions
-        int[][] deltas = {{-1,0}, {1,0}, {0,-1}, {0,1}};
-        EdgeType[] pieceEdges = {EdgeType.TOP, EdgeType.BOTTOM, EdgeType.LEFT, EdgeType.RIGHT};
-        EdgeType[] neighborEdges = {EdgeType.BOTTOM, EdgeType.TOP, EdgeType.RIGHT, EdgeType.LEFT};
-        
-        for (int i = 0; i < 4; i++) {
-            int neighborRow = row + deltas[i][0];
-            int neighborCol = col + deltas[i][1];
-            
-            // Find piece at this neighbor position
-            int neighborId = -1;
-            for (Map.Entry<Integer, GridPos> entry : layout.entrySet()) {
-                GridPos gp = entry.getValue();
-                if (gp.row == neighborRow && gp.col == neighborCol) {
-                    neighborId = entry.getKey();
-                    break;
-                }
-            }
-            
-            if (neighborId != -1) {
-                // Score the edge match
-                PuzzlePiece neighbor = pieces.get(neighborId);
-                
-                double pixelDist = computeEdgePixelDifference(
-                    piece.image, pieceEdges[i],
-                    neighbor.image, neighborEdges[i]);
-                
-                float[] rgb1 = computeEdgeHistogram(piece.image, pieceEdges[i]);
-                float[] rgb2 = computeEdgeHistogram(neighbor.image, neighborEdges[i]);
-                double rgbDist = histogramDistance(rgb1, rgb2);
-                
-                double edgeScore = pixelDist + 0.2 * rgbDist;
-                totalScore += edgeScore;
-                neighborCount++;
-            }
-        }
-        
-        // Average score across neighbors (or high penalty if no neighbors)
-        return neighborCount > 0 ? totalScore / neighborCount : 1000.0;
-    }
-
-    /**
-     * Create animated solution showing pieces moving to final positions
-     */
-    public void showAnimatedSolution(Map<Integer, GridPos> layout) {
-        if (layout.isEmpty()) {
-            System.out.println("No pieces to animate!");
-            return;
-        }
-
-        // Calculate final positions
-        List<PuzzlePiece> placed = new ArrayList<>();
-        for (PuzzlePiece p : pieces) {
-            if (layout.containsKey(p.id)) {
-                placed.add(p);
-            }
-        }
-
-        if (placed.isEmpty()) return;
-
-        int maxR = 0, maxC = 0;
-        for (GridPos gp : layout.values()) {
-            maxR = Math.max(maxR, gp.row);
-            maxC = Math.max(maxC, gp.col);
-        }
-
-        int totalW = 0, totalH = 0;
-        for (PuzzlePiece p : placed) {
-            totalW += p.image.getWidth();
-            totalH += p.image.getHeight();
-        }
-        
-        final int tileW = totalW / placed.size();
-        final int tileH = totalH / placed.size();
-
-        int canvasW = (maxC + 1) * tileW + 100;
-        int canvasH = (maxR + 1) * tileH + 100;
-
-        // Create animation frame
-        JFrame animFrame = new JFrame("Puzzle Animation");
-        animFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        animFrame.setSize(canvasW, canvasH);
-
-        // Custom panel for animation
-        class AnimationPanel extends JPanel {
-            private float animProgress = 0.0f;
-            private final List<PuzzlePiece> piecesToAnimate;
-            private final Map<Integer, GridPos> layoutMap;
-            private final int tileSizeW;
-            private final int tileSizeH;
-
-            public AnimationPanel(List<PuzzlePiece> pieces, Map<Integer, GridPos> layout, 
-                                int tileWidth, int tileHeight) {
-                this.piecesToAnimate = pieces;
-                this.layoutMap = layout;
-                this.tileSizeW = tileWidth;
-                this.tileSizeH = tileHeight;
-            }
-
-            @Override
-            protected void paintComponent(Graphics g) {
-                super.paintComponent(g);
-                Graphics2D g2d = (Graphics2D) g;
-                g2d.setColor(Color.BLACK);
-                g2d.fillRect(0, 0, getWidth(), getHeight());
-
-                for (PuzzlePiece p : piecesToAnimate) {
-                    GridPos finalPos = layoutMap.get(p.id);
-                    
-                    // Start position (original scattered position)
-                    int startX = p.bounds.x;
-                    int startY = p.bounds.y;
-                    
-                    // End position (grid position)
-                    int endX = finalPos.col * tileSizeW + 50;
-                    int endY = finalPos.row * tileSizeH + 50;
-                    
-                    // Interpolate
-                    int currentX = (int) (startX + (endX - startX) * animProgress);
-                    int currentY = (int) (startY + (endY - startY) * animProgress);
-                    
-                    g2d.drawImage(p.image, currentX, currentY, null);
-                    
-                    // Draw piece number
-                    g2d.setColor(Color.YELLOW);
-                    g2d.setFont(new Font("Arial", Font.BOLD, 12));
-                    g2d.drawString("" + p.id, currentX + 5, currentY + 15);
-                }
-            }
-
-            public void updateAnimation(float progress) {
-                this.animProgress = progress;
-                repaint();
-            }
-        }
-
-        AnimationPanel animPanel = new AnimationPanel(placed, layout, tileW, tileH);
-        animFrame.add(animPanel);
-        animFrame.setVisible(true);
-
-        // Animate
-        new Thread(() -> {
-            try {
-                for (int step = 0; step <= 100; step++) {
-                    float progress = step / 100.0f;
-                    // Ease-in-out
-                    progress = (float) (-(Math.cos(Math.PI * progress) - 1) / 2);
-                    
-                    final float finalProgress = progress;
-                    SwingUtilities.invokeLater(() -> animPanel.updateAnimation(finalProgress));
-                    
-                    Thread.sleep(30); // 30ms per frame = ~33fps
-                }
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }).start();
-    }
-
-    public void showReconstructedPuzzle(Map<Integer, GridPos> layout) {
-
-        if (layout.isEmpty()) {
-            System.out.println("No connected component found; nothing to display.");
-            return;
-        }
-
-        List<PuzzlePiece> placed = new ArrayList<>();
-        for (PuzzlePiece p : pieces) {
-            if (layout.containsKey(p.id)) {
-                placed.add(p);
-            }
-        }
-
-        if (placed.isEmpty()) {
-            System.out.println("No pieces placed in layout.");
-            return;
-        }
-
-        int maxR = 0, maxC = 0;
-        for (GridPos gp : layout.values()) {
-            maxR = Math.max(maxR, gp.row);
-            maxC = Math.max(maxC, gp.col);
-        }
-
-        int tileW = 0, tileH = 0;
-        for (PuzzlePiece p : placed) {
-            tileW += p.image.getWidth();
-            tileH += p.image.getHeight();
-        }
-        tileW /= placed.size();
-        tileH /= placed.size();
-
-        int canvasW = (maxC + 1) * tileW;
-        int canvasH = (maxR + 1) * tileH;
-
-        BufferedImage assembled = new BufferedImage(canvasW, canvasH, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = assembled.createGraphics();
-        g.setColor(Color.BLACK);
-        g.fillRect(0, 0, canvasW, canvasH);
-
-        for (PuzzlePiece p : placed) {
-            GridPos gp = layout.get(p.id);
-            int x = gp.col * tileW;
-            int y = gp.row * tileH;
-            g.drawImage(p.image, x, y, null);
-        }
-
-        g.dispose();
-
-        JFrame f = new JFrame("Assembled Puzzle");
-        f.add(new JLabel(new ImageIcon(assembled)));
-        f.pack();
-        f.setVisible(true);
-    }
-
-    // ~~~~~~~~~~~~~~~
-    // Boilerplate
     public void showIms() {
         frame = new JFrame();
         GridBagLayout gLayout = new GridBagLayout();
@@ -1622,8 +1242,6 @@ public class ImageDisplay {
         frame.setVisible(true);
     }
 
-    // ~~~~~~~~~~~~~~~
-    // main!!!!
     public static void main(String[] args) {
         ImageDisplay iq = new ImageDisplay();
         iq.parseArgs(args);
@@ -1633,16 +1251,18 @@ public class ImageDisplay {
 
         iq.detectPieces();
 
+        iq.showInputImage();
+
         iq.showPiecesRotatedOnCanvas();
         iq.showIms();
         iq.showExtractedPieces();
 
+        // Perform edge matching and assembly
         List<EdgeMatch> matches = iq.performEdgeMatching();
-        Map<Integer, Map<EdgeType, PlacementEdge>> graph = iq.buildAdjacencyGraph(matches);
-        Map<Integer, GridPos> layout = iq.computeLayoutFromGraph(graph);
-        iq.placeRemainingPieces(layout, graph);
+        Map<Integer, GridPos> layout = iq.computeLayoutFromGraph(matches);
+        iq.placeRemainingPieces(layout, matches);
 
-        // Show both static and animated results
+        // Show results
         iq.showReconstructedPuzzle(layout);
         iq.showAnimatedSolution(layout);
     }
