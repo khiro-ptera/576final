@@ -22,10 +22,10 @@ public class ImageDisplay {
 
     String imagePath;
 
-    // Detected puzzle pieces
+    // Detected pieces
     List<PuzzlePiece> pieces = new ArrayList<>();
 
-    // Class to represent a detected puzzle piece
+    // Class to represent piece
     static class PuzzlePiece {
         BufferedImage image;   // final, axis-aligned, rectangular tile
         Rectangle bounds;      // original bounding box in source image
@@ -259,8 +259,9 @@ public class ImageDisplay {
         BufferedImage pieceImage = extractAndRotatePiece(localPixels, bounds, rotationAngle);
 
         PuzzlePiece piece = new PuzzlePiece(pieceImage, bounds, id);
-        piece.rotationAngle = rotationAngle;
+        piece.rotationAngle = rotationAngle; // keep for logging
         piece.initialPosition = new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        // Use detected angle so animation shows rotation back to upright
         piece.initialRotation = rotationAngle;
         return piece;
     }
@@ -499,6 +500,86 @@ public class ImageDisplay {
             }
         }
         return dst;
+    }
+
+    /**
+     * Add a small replicated border around the image to help fill tiny gaps
+     * between tiles when composing the final puzzle. Pads by `pad` pixels on
+     * all sides by copying edge pixels outward.
+     */
+    private BufferedImage replicateBorderPixels(BufferedImage src, int pad) {
+        if (pad <= 0) return src;
+        int w = src.getWidth();
+        int h = src.getHeight();
+        BufferedImage out = new BufferedImage(w + 2 * pad, h + 2 * pad, src.getType());
+
+        // Fill center
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                out.setRGB(x + pad, y + pad, src.getRGB(x, y));
+            }
+        }
+
+        // Helper to decide if a pixel is background-ish
+        int bgRGB = estimateBackgroundColor();
+        java.util.function.IntPredicate isBg = (rgb) -> {
+            int r = (rgb >> 16) & 0xFF;
+            int g = (rgb >> 8) & 0xFF;
+            int b = rgb & 0xFF;
+            // near-black from prior alpha cleanup
+            boolean nearBlack = r < 8 && g < 8 && b < 8;
+            // close to global background
+            int br = (bgRGB >> 16) & 0xFF;
+            int bgc = (bgRGB >> 8) & 0xFF;
+            int bb = bgRGB & 0xFF;
+            int diff = Math.abs(r - br) + Math.abs(g - bgc) + Math.abs(b - bb);
+            return nearBlack || diff < 40;
+        };
+
+        // Top and bottom rows (replicate)
+        for (int x = 0; x < w; x++) {
+            int topPix = src.getRGB(x, 0);
+            int botPix = src.getRGB(x, h - 1);
+            // Replace background-looking pixels with inner neighbor
+            if (isBg.test(topPix) && h > 1) topPix = src.getRGB(x, Math.min(1, h - 1));
+            if (isBg.test(botPix) && h > 1) botPix = src.getRGB(x, Math.max(h - 2, 0));
+            for (int p = 0; p < pad; p++) {
+                out.setRGB(x + pad, p, topPix);
+                out.setRGB(x + pad, h + pad + p, botPix);
+            }
+        }
+
+        // Left and right columns (replicate)
+        for (int y = 0; y < h; y++) {
+            int leftPix = src.getRGB(0, y);
+            int rightPix = src.getRGB(w - 1, y);
+            if (isBg.test(leftPix) && w > 1) leftPix = src.getRGB(Math.min(1, w - 1), y);
+            if (isBg.test(rightPix) && w > 1) rightPix = src.getRGB(Math.max(w - 2, 0), y);
+            for (int p = 0; p < pad; p++) {
+                out.setRGB(p, y + pad, leftPix);
+                out.setRGB(w + pad + p, y + pad, rightPix);
+            }
+        }
+
+        // Corners: use inner neighbor if corner looks like background
+        int tl = src.getRGB(0, 0);
+        int tr = src.getRGB(w - 1, 0);
+        int bl = src.getRGB(0, h - 1);
+        int br = src.getRGB(w - 1, h - 1);
+        if (isBg.test(tl) && w > 1 && h > 1) tl = src.getRGB(Math.min(1, w - 1), Math.min(1, h - 1));
+        if (isBg.test(tr) && w > 1 && h > 1) tr = src.getRGB(Math.max(w - 2, 0), Math.min(1, h - 1));
+        if (isBg.test(bl) && w > 1 && h > 1) bl = src.getRGB(Math.min(1, w - 1), Math.max(h - 2, 0));
+        if (isBg.test(br) && w > 1 && h > 1) br = src.getRGB(Math.max(w - 2, 0), Math.max(h - 2, 0));
+        for (int pY = 0; pY < pad; pY++) {
+            for (int pX = 0; pX < pad; pX++) {
+                out.setRGB(pX, pY, tl);
+                out.setRGB(w + pad + pX, pY, tr);
+                out.setRGB(pX, h + pad + pY, bl);
+                out.setRGB(w + pad + pX, h + pad + pY, br);
+            }
+        }
+
+        return out;
     }
 
     // ~~~~~~~~~~~~~~~
@@ -1059,7 +1140,7 @@ public class ImageDisplay {
                 double cy = rowY.get(p.gridRow) + cellH / 2.0;
                 
                 p.finalPosition = new Point((int) cx, (int) cy);
-                p.finalRotation = -p.initialRotation;  // Rotate back to upright orientation
+                p.finalRotation = 0;  // End state is axis-aligned
                 
                 System.out.println("  Piece " + p.id + " final pos: (" + (int)cx + ", " + (int)cy + ")" +
                                  " from initial: (" + p.initialPosition.x + ", " + p.initialPosition.y + ")" +
@@ -1075,15 +1156,17 @@ public class ImageDisplay {
     public void showAnimatedSolution(Map<Integer, GridPos> layout) {
         normalizeMLayoutAndComputeFinalPositions(layout);
         
-        int frameCount = 50;
+        int frameCount = 80;  // slower, smoother animation
         int canvasW = width;
         int canvasH = height;
         
         System.out.println("Starting animation with " + frameCount + " frames...");
         
         for (int f = 0; f < frameCount; f++) {
-            // Match Python: alpha goes from 0 to 1 over frameCount frames
-            double alpha = f / (double) (frameCount - 1);
+            // Two-phase animation: rotate faster, then move
+            double t = f / (double) (frameCount - 1);
+            double rotateAlpha = Math.min(1.0, t / 0.5);          // rotation completes by 50%
+            double moveAlpha   = Math.max(0.0, (t - 0.3) / 0.7);   // movement ramps from 30% to 100%
             
             BufferedImage canvas = new BufferedImage(canvasW, canvasH, BufferedImage.TYPE_INT_RGB);
             Graphics2D g = canvas.createGraphics();
@@ -1095,12 +1178,16 @@ public class ImageDisplay {
             
             for (PuzzlePiece p : pieces) {
                 // Interpolate position and rotation (linear interpolation)
-                double x = p.initialPosition.x * (1 - alpha) + p.finalPosition.x * alpha;
-                double y = p.initialPosition.y * (1 - alpha) + p.finalPosition.y * alpha;
-                double angle = p.initialRotation * (1 - alpha) + p.finalRotation * alpha;
+                double x = p.initialPosition.x * (1 - moveAlpha) + p.finalPosition.x * moveAlpha;
+                double y = p.initialPosition.y * (1 - moveAlpha) + p.finalPosition.y * moveAlpha;
+                double angle = p.initialRotation * (1 - rotateAlpha) + p.finalRotation * rotateAlpha;
                 
                 // Draw piece at interpolated position/rotation
                 BufferedImage img = p.image;
+                // On the final frame, use a 1px replicated border to close tiny seams
+                if (f == frameCount - 1) {
+                    img = replicateBorderPixels(img, 1);
+                }
                 
                 // Apply transformation: translate to position, rotate around center
                 AffineTransform transform = new AffineTransform();
@@ -1156,7 +1243,8 @@ public class ImageDisplay {
         g.fillRect(0, 0, canvasW, canvasH);
         
         for (PuzzlePiece p : pieces) {
-            BufferedImage img = p.image;
+            // Pad borders by 1px to help close tiny gaps
+            BufferedImage img = replicateBorderPixels(p.image, 1);
             
             // Apply additional rotation if needed
             if (p.additionalRotation != 0) {
@@ -1239,6 +1327,10 @@ public class ImageDisplay {
         frame.getContentPane().add(lbIm1, c);
 
         frame.pack();
+        // Make animation window a bit smaller than full image size
+        int animW = Math.min(width, 700);
+        int animH = Math.min(height, 700);
+        frame.setSize(animW, animH);
         frame.setVisible(true);
     }
 
@@ -1251,11 +1343,12 @@ public class ImageDisplay {
 
         iq.detectPieces();
 
-        iq.showInputImage();
+        // Show only the animation window; keep other windows disabled
+        // iq.showInputImage();
 
         iq.showPiecesRotatedOnCanvas();
         iq.showIms();
-        iq.showExtractedPieces();
+        // iq.showExtractedPieces();
 
         // Perform edge matching and assembly
         List<EdgeMatch> matches = iq.performEdgeMatching();
@@ -1263,7 +1356,7 @@ public class ImageDisplay {
         iq.placeRemainingPieces(layout, matches);
 
         // Show results
-        iq.showReconstructedPuzzle(layout);
+        // iq.showReconstructedPuzzle(layout);
         iq.showAnimatedSolution(layout);
     }
 }
