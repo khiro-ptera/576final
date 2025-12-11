@@ -254,7 +254,6 @@ public class ImageDisplay {
             localPixels.add(new Point(lx, ly));
         }
 
-        // Use minimum area rectangle approach like Python
         double rotationAngle = detectRotationFromContour(piecePixels, bounds);
         BufferedImage pieceImage = extractAndRotatePiece(localPixels, bounds, rotationAngle);
 
@@ -266,10 +265,7 @@ public class ImageDisplay {
         return piece;
     }
 
-    /**
-     * Detect rotation using minimum area rectangle approach (mimics Python's minAreaRect).
-     * Analyzes corner positions to determine correct orientation like Python does.
-     */
+    // Detect rotation
     private double detectRotationFromContour(List<Point> pixels, Rectangle bounds) {
         if (pixels.isEmpty()) return 0.0;
         
@@ -320,11 +316,7 @@ public class ImageDisplay {
             }
         }
         
-        // PYTHON LOGIC: Use corner analysis to determine correct orientation
-        // Python uses cv2.boxPoints() on the min-area-rect, sorts by y-coordinate,
-        // then checks if coords[2][0] < coords[0][0] to add 90° if needed
-        
-        // For our min-area-rect at bestAngle, compute the 4 corners
+        // compute the 4 corners
         double rad = Math.toRadians(bestAngle);
         double cos = Math.cos(rad);
         double sin = Math.sin(rad);
@@ -344,7 +336,6 @@ public class ImageDisplay {
             if (ry > maxY) maxY = ry;
         }
         
-        // 4 corners of minimum area rectangle in rotated coords
         // Then transform back to original coords
         Point2D.Double[] corners = new Point2D.Double[4];
         double[][] rotCorners = {
@@ -359,12 +350,10 @@ public class ImageDisplay {
             corners[i] = new Point2D.Double(ox, oy);
         }
         
-        // Sort corners by y-coordinate (like Python)
+        // Sort corners by y-coordinate
         Point2D.Double[] sortedCorners = corners.clone();
         java.util.Arrays.sort(sortedCorners, (c1, c2) -> Double.compare(c1.y, c2.y));
         
-        // Python logic: if coords[2][0] < coords[0][0], add 90°
-        // (This checks if the 3rd-smallest-y corner is to the left of the 1st-smallest-y corner)
         if (sortedCorners[2].x < sortedCorners[0].x) {
             bestAngle += 90;
         }
@@ -420,7 +409,7 @@ public class ImageDisplay {
         g2d.drawImage(original, 0, 0, null);
         g2d.dispose();
 
-        // Remove 1-pixel border from rotation artifacts (like Python's tile_img[1:-1, 1:-1])
+        // Remove 1-pixel border from rotation artifacts
         BufferedImage cropped = cropToContent(rotated);
         
         // Clean anti-aliased edges by removing low-alpha pixels at boundaries
@@ -433,7 +422,6 @@ public class ImageDisplay {
     
     /**
      * Clean anti-aliased borders by removing anti-aliasing artifacts.
-     * Mimics Python's tile_img[1:-1, 1:-1] which removes 1 pixel from each edge.
      * This removes the fuzzy black edges created by bilinear interpolation during rotation.
      */
     private BufferedImage cleanBorders(BufferedImage img) {
@@ -445,7 +433,7 @@ public class ImageDisplay {
             return img;
         }
         
-        // Crop exactly 1 pixel from each side, like Python's [1:-1, 1:-1]
+        // Crop exactly 1 pixel from each side
         int newW = w - 2;
         int newH = h - 2;
         
@@ -561,7 +549,7 @@ public class ImageDisplay {
             }
         }
 
-        // Corners: use inner neighbor if corner looks like background
+        // use inner neighbor if corner looks like background
         int tl = src.getRGB(0, 0);
         int tr = src.getRGB(w - 1, 0);
         int bl = src.getRGB(0, h - 1);
@@ -583,14 +571,8 @@ public class ImageDisplay {
     }
 
     // ~~~~~~~~~~~~~~~
-    // Simple MSE-based Edge Matching (from Python solution)
+    // Simple MSE-based Edge Matching 
     
-    /**
-     * Extract edge pixels from an image for a given edge type.
-     * Matches Python behavior: extract from the actual border pixels,
-     * assuming the image has already been cleaned of anti-aliasing.
-     * Returns flattened RGB values [r1,g1,b1,r2,g2,b2,...] for MSE calculation.
-     */
     private int[] extractEdgePixels(BufferedImage img, EdgeType edge) {
         int h = img.getHeight();
         int w = img.getWidth();
@@ -680,9 +662,7 @@ public class ImageDisplay {
         return resampled;
     }
     
-    /**
-     * Check if two edges can be adjacent based on direction.
-     */
+    //Check if two edges can be adjacent based on direction.
     private boolean areEdgesCompatible(EdgeType e1, EdgeType e2) {
         return (e1 == EdgeType.TOP && e2 == EdgeType.BOTTOM) ||
                (e1 == EdgeType.BOTTOM && e2 == EdgeType.TOP) ||
@@ -754,12 +734,8 @@ public class ImageDisplay {
     }
 
     // ~~~~~~~~~~~~~~~
-    // Puzzle Assembly (from Python algorithm)
+    // Puzzle Assembly
     
-    /**
-     * Compute layout from edge matches, starting with best pair (like Python algorithm).
-     * Uses grid coordinates (col, row) where col is x and row is y.
-     */
     public Map<Integer, GridPos> computeLayoutFromGraph(List<EdgeMatch> matches) {
         Map<Integer, GridPos> layout = new HashMap<>();
         Set<Integer> placed = new HashSet<>();
@@ -770,7 +746,7 @@ public class ImageDisplay {
         }
         
         if (matches.isEmpty()) {
-            // Fallback: place first piece at origin
+            // Fallback
             layout.put(0, new GridPos(0, 0));
             placed.add(0);
             remaining.remove(0);
@@ -890,7 +866,7 @@ public class ImageDisplay {
                 }
             }
             
-            // If no good match found, use fallback strategy from Python
+            // fallback
             if (bestTile == -1) {
                 // Pick any remaining tile
                 bestTile = remaining.iterator().next();
@@ -979,9 +955,6 @@ public class ImageDisplay {
         }
     }
     
-    /**
-     * Get the opposite edge direction.
-     */
     private EdgeType getOppositeEdge(EdgeType edge) {
         switch (edge) {
             case TOP: return EdgeType.BOTTOM;
@@ -992,9 +965,6 @@ public class ImageDisplay {
         }
     }
 
-    /**
-     * Place remaining pieces that weren't placed in the initial algorithm.
-     */
     public void placeRemainingPieces(Map<Integer, GridPos> layout,
                                     List<EdgeMatch> matches) {
         
@@ -1068,10 +1038,6 @@ public class ImageDisplay {
         }
     }
 
-    /**
-     * Normalize layout positions and compute final positions for animation.
-     * Matches Python's approach: handle variable tile sizes properly.
-     */
     private void normalizeMLayoutAndComputeFinalPositions(Map<Integer, GridPos> layout) {
         if (layout.isEmpty()) return;
         
@@ -1088,7 +1054,7 @@ public class ImageDisplay {
         
         System.out.println("Grid dimensions: rows [" + minRow + " to " + maxRow + "], cols [" + minCol + " to " + maxCol + "]");
         
-        // Compute column widths and row heights (like Python's col_widths/row_heights)
+        // Compute column widths and row heights
         Map<Integer, Integer> colWidths = new HashMap<>();
         Map<Integer, Integer> rowHeights = new HashMap<>();
         
@@ -1129,7 +1095,7 @@ public class ImageDisplay {
             System.out.println("  Row " + r + ": y=" + rowY.get(r) + ", height=" + height);
         }
         
-        // Set final positions (centered in their cells, like Python)
+        // Set final positions
         for (PuzzlePiece p : pieces) {
             if (p.gridRow >= 0 && p.gridCol >= 0) {
                 int cellW = colWidths.getOrDefault(p.gridCol, p.image.getWidth());
@@ -1160,10 +1126,9 @@ public class ImageDisplay {
         int canvasW = width;
         int canvasH = height;
         
-        System.out.println("Starting animation with " + frameCount + " frames...");
+        System.out.println("Starting animation with " + frameCount + " frames");
         
         for (int f = 0; f < frameCount; f++) {
-            // Two-phase animation: rotate faster, then move
             double t = f / (double) (frameCount - 1);
             double rotateAlpha = Math.min(1.0, t / 0.5);          // rotation completes by 50%
             double moveAlpha   = Math.max(0.0, (t - 0.3) / 0.7);   // movement ramps from 30% to 100%
@@ -1214,7 +1179,7 @@ public class ImageDisplay {
             }
         }
         
-        System.out.println("Animation complete!");
+        System.out.println("Animation complete");
     }
 
     public void showInputImage() {
@@ -1243,7 +1208,7 @@ public class ImageDisplay {
         g.fillRect(0, 0, canvasW, canvasH);
         
         for (PuzzlePiece p : pieces) {
-            // Pad borders by 1px to help close tiny gaps
+            // close gaps
             BufferedImage img = replicateBorderPixels(p.image, 1);
             
             // Apply additional rotation if needed
@@ -1327,7 +1292,7 @@ public class ImageDisplay {
         frame.getContentPane().add(lbIm1, c);
 
         frame.pack();
-        // Make animation window a bit smaller than full image size
+
         int animW = Math.min(width, 700);
         int animH = Math.min(height, 700);
         frame.setSize(animW, animH);
@@ -1343,7 +1308,6 @@ public class ImageDisplay {
 
         iq.detectPieces();
 
-        // Show only the animation window; keep other windows disabled
         // iq.showInputImage();
 
         iq.showPiecesRotatedOnCanvas();
@@ -1355,7 +1319,6 @@ public class ImageDisplay {
         Map<Integer, GridPos> layout = iq.computeLayoutFromGraph(matches);
         iq.placeRemainingPieces(layout, matches);
 
-        // Show results
         // iq.showReconstructedPuzzle(layout);
         iq.showAnimatedSolution(layout);
     }
