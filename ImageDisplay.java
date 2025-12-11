@@ -245,7 +245,7 @@ public class ImageDisplay {
     }
 
     /**
-     * Advanced anti-aliasing + edge healing for rotated puzzle pieces.
+     * Advanced anti-aliasing + edge healing for rotated puzzle pieces. TOO BLURRY
      *
      * Pipeline:
      *   1. Light Gaussian blur to remove rotation staircasing artifacts
@@ -253,115 +253,171 @@ public class ImageDisplay {
      *   3. Edge strip regression: rebuilds the outer 2 pixels using
      *      the predicted color from a 5px inward strip.
      */
+    /**
+     * Advanced edge healing for rotated pieces.
+     * Strategy: Use median filtering + aggressive inpainting to preserve edge sharpness
+     * while removing rotation artifacts.
+     */
     private BufferedImage cleanBorderInpaint(BufferedImage img) {
         int w = img.getWidth();
         int h = img.getHeight();
-
+        
         // -------------------------
-        // 1. Gaussian blur (3x3)
+        // 1. Apply 3x3 median filter to kill rotation noise
+        //    (preserves edges better than Gaussian)
         // -------------------------
-        float[] gaussian = {
-                1f/16, 2f/16, 1f/16,
-                2f/16, 4f/16, 2f/16,
-                1f/16, 2f/16, 1f/16
-        };
-        ConvolveOp blur = new ConvolveOp(new Kernel(3, 3, gaussian),
-                ConvolveOp.EDGE_NO_OP, null);
-        BufferedImage blurred = blur.filter(img, null);
-
+        BufferedImage median = applyMedianFilter(img, 3);
+        
         // -------------------------
-        // 2. Bicubic downsample → upsample
-        //    This kills subpixel aliasing from rotation
+        // 2. Aggressive edge reconstruction:
+        //    Sample 8-12 pixels inward (deep enough to avoid artifacts)
+        //    Use LINEAR regression to predict edge colors
         // -------------------------
-        int dsW = Math.max(1, w / 2);
-        int dsH = Math.max(1, h / 2);
-
-        BufferedImage ds = new BufferedImage(dsW, dsH, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g1 = ds.createGraphics();
-        g1.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-        g1.drawImage(blurred, 0, 0, dsW, dsH, null);
-        g1.dispose();
-
-        BufferedImage smooth = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g2 = smooth.createGraphics();
-        g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-        g2.drawImage(ds, 0, 0, w, h, null);
-        g2.dispose();
-
-        // -------------------------
-        // 3. Edge strip regression
-        // -------------------------
-        final int STRIP = 5;  // look inward 5 pixels (safe after blur)
-
+        final int SAMPLE_DEPTH = 10;  // Look 10 pixels inward
+        final int REPLACE_DEPTH = 3;   // Replace outer 3 pixels
+        
+        BufferedImage cleaned = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = cleaned.createGraphics();
+        g.drawImage(median, 0, 0, null);
+        g.dispose();
+        
         // TOP edge
         for (int x = 0; x < w; x++) {
-            int sumR=0,sumG=0,sumB=0,count=0;
-            for (int dy=1; dy<=STRIP && dy<h; dy++) {
-                int rgb = smooth.getRGB(x, dy);
-                sumR += (rgb>>16)&255;
-                sumG += (rgb>>8)&255;
-                sumB += rgb&255;
-                count++;
+            int[] colors = new int[SAMPLE_DEPTH];
+            int count = 0;
+            for (int dy = REPLACE_DEPTH; dy < REPLACE_DEPTH + SAMPLE_DEPTH && dy < h; dy++) {
+                colors[count++] = cleaned.getRGB(x, dy);
             }
-            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
-            int rgb = (pr<<16)|(pg<<8)|pb;
-            smooth.setRGB(x, 0, rgb);
-            if (h>1) smooth.setRGB(x, 1, rgb);
+            if (count > 0) {
+                int predictedColor = extrapolateColor(colors, count, -1);
+                for (int dy = 0; dy < REPLACE_DEPTH && dy < h; dy++) {
+                    cleaned.setRGB(x, dy, predictedColor);
+                }
+            }
         }
-
-        // BOTTOM
+        
+        // BOTTOM edge
         for (int x = 0; x < w; x++) {
-            int sumR=0,sumG=0,sumB=0,count=0;
-            for (int dy=1; dy<=STRIP && dy<h; dy++) {
-                int y = h-1-dy;
-                int rgb = smooth.getRGB(x, y);
-                sumR += (rgb>>16)&255;
-                sumG += (rgb>>8)&255;
-                sumB += rgb&255;
-                count++;
+            int[] colors = new int[SAMPLE_DEPTH];
+            int count = 0;
+            for (int dy = REPLACE_DEPTH; dy < REPLACE_DEPTH + SAMPLE_DEPTH && dy < h; dy++) {
+                int y = h - 1 - dy;
+                colors[count++] = cleaned.getRGB(x, y);
             }
-            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
-            int rgb = (pr<<16)|(pg<<8)|pb;
-            smooth.setRGB(x, h-1, rgb);
-            if (h>1) smooth.setRGB(x, h-2, rgb);
+            if (count > 0) {
+                int predictedColor = extrapolateColor(colors, count, -1);
+                for (int dy = 0; dy < REPLACE_DEPTH && dy < h; dy++) {
+                    cleaned.setRGB(x, h - 1 - dy, predictedColor);
+                }
+            }
         }
-
-        // LEFT
+        
+        // LEFT edge
         for (int y = 0; y < h; y++) {
-            int sumR=0,sumG=0,sumB=0,count=0;
-            for (int dx=1; dx<=STRIP && dx<w; dx++) {
-                int rgb = smooth.getRGB(dx, y);
-                sumR += (rgb>>16)&255;
-                sumG += (rgb>>8)&255;
-                sumB += rgb&255;
-                count++;
+            int[] colors = new int[SAMPLE_DEPTH];
+            int count = 0;
+            for (int dx = REPLACE_DEPTH; dx < REPLACE_DEPTH + SAMPLE_DEPTH && dx < w; dx++) {
+                colors[count++] = cleaned.getRGB(dx, y);
             }
-            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
-            int rgb = (pr<<16)|(pg<<8)|pb;
-            smooth.setRGB(0, y, rgb);
-            if (w>1) smooth.setRGB(1, y, rgb);
+            if (count > 0) {
+                int predictedColor = extrapolateColor(colors, count, -1);
+                for (int dx = 0; dx < REPLACE_DEPTH && dx < w; dx++) {
+                    cleaned.setRGB(dx, y, predictedColor);
+                }
+            }
         }
-
-        // RIGHT
+        
+        // RIGHT edge
         for (int y = 0; y < h; y++) {
-            int sumR=0,sumG=0,sumB=0,count=0;
-            for (int dx=1; dx<=STRIP && dx<w; dx++) {
-                int x = w-1-dx;
-                int rgb = smooth.getRGB(x, y);
-                sumR += (rgb>>16)&255;
-                sumG += (rgb>>8)&255;
-                sumB += rgb&255;
-                count++;
+            int[] colors = new int[SAMPLE_DEPTH];
+            int count = 0;
+            for (int dx = REPLACE_DEPTH; dx < REPLACE_DEPTH + SAMPLE_DEPTH && dx < w; dx++) {
+                int x = w - 1 - dx;
+                colors[count++] = cleaned.getRGB(x, y);
             }
-            int pr = sumR/count, pg = sumG/count, pb = sumB/count;
-            int rgb = (pr<<16)|(pg<<8)|pb;
-            smooth.setRGB(w-1, y, rgb);
-            if (w>1) smooth.setRGB(w-2, y, rgb);
+            if (count > 0) {
+                int predictedColor = extrapolateColor(colors, count, -1);
+                for (int dx = 0; dx < REPLACE_DEPTH && dx < w; dx++) {
+                    cleaned.setRGB(w - 1 - dx, y, predictedColor);
+                }
+            }
         }
+        
+        return cleaned;
+    }
 
-        return smooth;
+    /**
+     * Apply median filter to remove rotation noise while preserving edges
+     */
+    private BufferedImage applyMedianFilter(BufferedImage img, int size) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        BufferedImage result = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        
+        int half = size / 2;
+        int[] rValues = new int[size * size];
+        int[] gValues = new int[size * size];
+        int[] bValues = new int[size * size];
+        
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int count = 0;
+                
+                // Collect neighborhood
+                for (int dy = -half; dy <= half; dy++) {
+                    for (int dx = -half; dx <= half; dx++) {
+                        int nx = x + dx;
+                        int ny = y + dy;
+                        
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                            int rgb = img.getRGB(nx, ny);
+                            rValues[count] = (rgb >> 16) & 0xFF;
+                            gValues[count] = (rgb >> 8) & 0xFF;
+                            bValues[count] = rgb & 0xFF;
+                            count++;
+                        }
+                    }
+                }
+                
+                // Find median
+                Arrays.sort(rValues, 0, count);
+                Arrays.sort(gValues, 0, count);
+                Arrays.sort(bValues, 0, count);
+                
+                int medianR = rValues[count / 2];
+                int medianG = gValues[count / 2];
+                int medianB = bValues[count / 2];
+                
+                result.setRGB(x, y, (medianR << 16) | (medianG << 8) | medianB);
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * Extrapolate edge color using nearest neighbor with slight smoothing
+     * direction: -1 for inward extrapolation
+     */
+    private int extrapolateColor(int[] colors, int count, int direction) {
+        if (count == 0) return 0;
+        
+        // Use weighted average of first 3-5 samples (closest to edge)
+        int useCount = Math.min(5, count);
+        long sumR = 0, sumG = 0, sumB = 0;
+        
+        for (int i = 0; i < useCount; i++) {
+            int rgb = colors[i];
+            sumR += (rgb >> 16) & 0xFF;
+            sumG += (rgb >> 8) & 0xFF;
+            sumB += rgb & 0xFF;
+        }
+        
+        int avgR = (int) (sumR / useCount);
+        int avgG = (int) (sumG / useCount);
+        int avgB = (int) (sumB / useCount);
+        
+        return (avgR << 16) | (avgG << 8) | avgB;
     }
 
 
